@@ -381,7 +381,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
-static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands, f_flingGun, f_propGun, f_bounce;   // Overpowered
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
@@ -427,7 +427,6 @@ static void WeatherPicked();
 static void LongArmsToggled();
 static void NextArmLength();
 static void NextJumpPower();
-static void ApplyBigHands();
 static void OverpoweredOff();
 static void NextWeatherIntensity();
 
@@ -524,7 +523,6 @@ static Item g_items[] = {
     {OVERPOWERED, "Rocket Boots", TOGGLE, MAIN, &f_rocket},
     {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
     {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
-    {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
     {OVERPOWERED, "Fling Gun", TOGGLE, MAIN, &f_flingGun},
     {OVERPOWERED, "Launch Items Gun", TOGGLE, MAIN, &f_propGun},
     {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
@@ -610,7 +608,6 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Dab", "Hold left trigger to dab."},
     {"Bounce", "Bounce back up every time you land."},
     {"Fling Gun", "Press A (X) to fling yourself where you point."},
-    {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
@@ -1387,7 +1384,7 @@ static void DancePicked() {
     for (int i = 0; i < kDances; i++) if (g_danceSel[i] && i != g_dance) picked = i;
     for (int i = 0; i < kDances; i++) g_danceSel[i] = (i == picked);
     g_dance = picked;
-    if (picked >= 0) Notify("Hold left trigger to dance");
+    if (picked >= 0) { Notify("Hold left trigger to do it"); ym::log("clientdabell: pose %d picked, hold left trigger", picked); }
 }
 static float Rand01() { static uint32_t x = 2463534242u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return (x & 0xffff) / 65535.0f; }
 
@@ -2570,54 +2567,6 @@ static void GrappleTick(const Buttons &in, float dt) {
     SetVel(v);
 }
 
-// Big Hands: the game keeps resetting the size of the real hands, so big hands are drawn instead:
-// a palm, four fingers and a thumb, about 3x life size, attached to each hand. Only you see them.
-static Method<Vector3> g_trGetScale;
-static bool g_bigApplied = false;
-static Ref g_bigParts[2][6];
-static void BuildBigHand(Il2CppObject *hand, int side, Ref *parts) {
-    float hs = 1.0f;
-    if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
-    if (g_trGetScale.IsValid()) { hs = g_trGetScale[hand]().x; if (hs < 0.05f) hs = 1.0f; }
-    struct Part { float x, y, z, sx, sy, sz; };
-    const float th = side == 0 ? 0.15f : -0.15f;                   // thumb side (left hand: inward is +x)
-    const Part kParts[6] = {
-        {0, 0, 0.05f, 0.26f, 0.07f, 0.24f},                        // palm
-        {-0.09f, 0, 0.23f, 0.055f, 0.055f, 0.17f},                 // fingers
-        {-0.03f, 0, 0.26f, 0.055f, 0.055f, 0.20f},
-        {0.03f, 0, 0.26f, 0.055f, 0.055f, 0.20f},
-        {0.09f, 0, 0.23f, 0.055f, 0.055f, 0.17f},
-        {th, 0, 0.10f, 0.07f, 0.055f, 0.15f},                      // thumb
-    };
-    for (int i = 0; i < 6; i++) {
-        Il2CppObject *o = Prim(0, T().button, false);
-        if (!o) continue;
-        Il2CppObject *t = Tr(o);
-        G.trSetParent[t](hand, false);
-        G.trSetLocalPosition[t](Vector3(kParts[i].x / hs, kParts[i].y / hs, kParts[i].z / hs));
-        G.trSetLocalScale[t](Vector3(kParts[i].sx / hs, kParts[i].sy / hs, kParts[i].sz / hs));
-        parts[i].set(o);
-    }
-    ym::log("clientdabell: big hand %d built (hand scale %.2f)", side, hs);
-}
-static void ApplyBigHands() {
-    Il2CppObject *hands[2] = {g_leftHand.get(), g_rightHand.get()};
-    if (f_bigHands) {
-        for (int h = 0; h < 2; h++) {
-            if (!hands[h]) continue;
-            if (!Alive(g_bigParts[h][0].get())) BuildBigHand(hands[h], h, g_bigParts[h]);
-        }
-        static bool shown = true;
-        if (g_menuShown == shown) {                                // hidden while the menu is open so they don't cover it
-            shown = !g_menuShown;
-            for (auto &hand : g_bigParts) for (auto &r : hand) Show(r, shown);
-        }
-        g_bigApplied = true;
-    } else if (g_bigApplied) {
-        for (auto &hand : g_bigParts) for (auto &r : hand) Kill(r);
-        g_bigApplied = false;
-    }
-}
 
 static void OverpoweredOff() {
     for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) { *it.flag = false; if (it.fn) it.fn(); }
@@ -2632,14 +2581,11 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     FlingGunTick(in);
     BounceTick();
     ItemGunTick(in, dt);
-    if (f_bigHands || g_bigApplied) ApplyBigHands();
     LongArmsTick();
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
-    for (auto &hand : g_bigParts) for (auto &r : hand) r.clear();
     for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
-    g_bigApplied = false;
     g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
     g_megaPrev = g_poundPrev = g_pounding = g_flingPrev = g_shotPrev = false;
     for (auto &sh : g_shots) { Kill(sh.go); sh.born = -1; }
