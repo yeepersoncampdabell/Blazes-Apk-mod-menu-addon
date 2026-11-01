@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.2 Patch #1"
+#define CDB_VERSION "v1.2.3"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -381,7 +381,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
-static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands, f_flingGun, f_propGun, f_bounce;   // Overpowered
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
@@ -389,7 +389,7 @@ static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
 
-static constexpr int kDances = 8;
+static constexpr int kDances = 18;                 // 0-7 Rig Mods dances, 8-17 Emotes
 static bool g_danceSel[kDances];
 static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
 static int g_wx = -1;
@@ -427,12 +427,11 @@ static void WeatherPicked();
 static void LongArmsToggled();
 static void NextArmLength();
 static void NextJumpPower();
-static void ApplyBigHands();
 static void OverpoweredOff();
 static void NextWeatherIntensity();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -452,6 +451,7 @@ static Item g_items[] = {
     {MAIN, "Effects", OPEN, EFFECTS},
     {MAIN, "Overpowered", OPEN, OVERPOWERED},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
+    {MAIN, "Emotes", OPEN, EMOTES},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -470,6 +470,17 @@ static Item g_items[] = {
     {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
 
 
+    {EMOTES, "Exit Emotes", OPEN, MAIN},
+    {EMOTES, "Floss", TOGGLE, MAIN, &g_danceSel[8], DancePicked},
+    {EMOTES, "Dab", TOGGLE, MAIN, &g_danceSel[9], DancePicked},
+    {EMOTES, "Disco", TOGGLE, MAIN, &g_danceSel[10], DancePicked},
+    {EMOTES, "Clap", TOGGLE, MAIN, &g_danceSel[11], DancePicked},
+    {EMOTES, "Hype", TOGGLE, MAIN, &g_danceSel[12], DancePicked},
+    {EMOTES, "Robot", TOGGLE, MAIN, &g_danceSel[13], DancePicked},
+    {EMOTES, "Cheer", TOGGLE, MAIN, &g_danceSel[14], DancePicked},
+    {EMOTES, "Salute", TOGGLE, MAIN, &g_danceSel[15], DancePicked},
+    {EMOTES, "Flex", TOGGLE, MAIN, &g_danceSel[16], DancePicked},
+    {EMOTES, "Chicken Wings", TOGGLE, MAIN, &g_danceSel[17], DancePicked},
     {RIG, "Exit Rig Mods", OPEN, MAIN},
     {RIG, "Wave", TOGGLE, MAIN, &g_danceSel[0], DancePicked},
     {RIG, "Helicopter", TOGGLE, MAIN, &g_danceSel[1], DancePicked},
@@ -512,7 +523,6 @@ static Item g_items[] = {
     {OVERPOWERED, "Rocket Boots", TOGGLE, MAIN, &f_rocket},
     {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
     {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
-    {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
     {OVERPOWERED, "Fling Gun", TOGGLE, MAIN, &f_flingGun},
     {OVERPOWERED, "Launch Items Gun", TOGGLE, MAIN, &f_propGun},
     {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
@@ -593,9 +603,11 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Grapple Hook", "Hold either trigger (or both) to swing toward what that hand points at."},
     {"Ground Pound", "Both grips: mace smash with a shockwave."},
     {"Launch Items Gun", "Free-hand grip shoots local-only props."},
+    {"Emotes", "Poses and moves for your yeep: pick one, then hold left trigger."},
+    {"Floss", "Hold left trigger to floss."},
+    {"Dab", "Hold left trigger to dab."},
     {"Bounce", "Bounce back up every time you land."},
     {"Fling Gun", "Press A (X) to fling yourself where you point."},
-    {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
@@ -1372,7 +1384,7 @@ static void DancePicked() {
     for (int i = 0; i < kDances; i++) if (g_danceSel[i] && i != g_dance) picked = i;
     for (int i = 0; i < kDances; i++) g_danceSel[i] = (i == picked);
     g_dance = picked;
-    if (picked >= 0) Notify("Hold left trigger to dance");
+    if (picked >= 0) { Notify("Hold left trigger to do it"); ym::log("clientdabell: pose %d picked, hold left trigger", picked); }
 }
 static float Rand01() { static uint32_t x = 2463534242u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return (x & 0xffff) / 65535.0f; }
 
@@ -1448,6 +1460,57 @@ static void DanceTick(const Buttons &in, float dt) {
     case 6:   // Spaz: hands in front, shaking everywhere
         R = shoulder + f * 0.35f + r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
         L = shoulder + f * 0.35f - r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
+        break;
+    case 8: {   // Floss: both arms swing side to side at your hips, one forward while the other goes back
+        float sw = sinf(t * 9);
+        R = shoulder - up * 0.38f + r * (0.38f * sw) + f * (0.08f + 0.22f * sw);
+        L = shoulder - up * 0.38f + r * (0.38f * sw) - f * (0.08f + 0.22f * sw);
+        break;
+    }
+    case 9:   // Dab: one arm bent across your face, the other stretched out and up
+        R = hp + f * 0.2f + r * -0.05f + up * -0.08f;
+        L = shoulder - r * 0.62f + up * 0.32f + f * 0.1f;
+        break;
+    case 10: { // Disco: point up, then point at the floor, to the beat
+        bool beat = fmodf(t * 3.0f, 2.0f) < 1.0f;
+        R = shoulder + r * (beat ? 0.3f : 0.4f) + up * (beat ? 0.55f : -0.45f);
+        L = shoulder - r * 0.25f - up * 0.25f;
+        break;
+    }
+    case 11: { // Clap
+        float sp = 0.03f + 0.17f * (0.5f + 0.5f * sinf(t * 14));
+        R = shoulder + f * 0.35f + r * sp;
+        L = shoulder + f * 0.35f - r * sp;
+        break;
+    }
+    case 12:   // Hype: fist pumps over your head
+        R = shoulder + r * 0.3f + up * (0.3f + 0.35f * (0.5f + 0.5f * sinf(t * 9)));
+        L = shoulder - r * 0.25f - up * 0.25f;
+        break;
+    case 13: { // Robot: stiff jumps from pose to pose
+        int step = (int)(t * 2.5f) % 4;
+        const float rx[4] = {0.45f, 0.2f, 0.45f, 0.1f}, ry[4] = {0.0f, 0.4f, -0.3f, 0.2f};
+        R = shoulder + r * rx[step] + up * ry[step] + f * 0.15f;
+        L = shoulder - r * rx[(step + 2) % 4] + up * ry[(step + 2) % 4] + f * 0.15f;
+        break;
+    }
+    case 14:   // Cheer: both arms up and waving
+        R = shoulder + r * (0.35f + 0.1f * s) + up * 0.55f;
+        L = shoulder - r * (0.35f - 0.1f * s) + up * 0.55f;
+        break;
+    case 15:   // Salute
+        R = hp + f * 0.14f + r * 0.13f + up * 0.04f;
+        L = shoulder - r * 0.2f - up * 0.35f;
+        break;
+    case 16: { // Flex: both fists up by your head, pulsing
+        float pu = 0.04f * sinf(t * 10);
+        R = shoulder + r * (0.42f + pu) + up * (0.38f + pu);
+        L = shoulder - r * (0.42f + pu) + up * (0.38f + pu);
+        break;
+    }
+    case 17:   // Chicken Wings: elbows out, flapping
+        R = shoulder + r * 0.4f + up * (0.12f + 0.12f * s);
+        L = shoulder - r * 0.4f + up * (0.12f - 0.12f * s);
         break;
     default:  // Beyblade: hands spin fast around your waist
         R = shoulder - up * 0.3f + r * (0.5f * cosf(t * 20)) + f * (0.5f * sinf(t * 20));
@@ -2504,32 +2567,6 @@ static void GrappleTick(const Buttons &in, float dt) {
     SetVel(v);
 }
 
-// Big Hands: both hands are scaled up and put back afterwards.
-static Method<Vector3> g_trGetScale;
-static bool g_bigApplied = false;
-static Vector3 g_handScaleL, g_handScaleR;
-static void ApplyBigHands() {
-    Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
-    if (!lh || !rh) return;
-    if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
-    if (!g_trGetScale.IsValid()) { static bool once = false; if (!once) { once = true; ym::log("clientdabell: big hands: can't read hand scale"); } return; }
-    static Method<int> childCount = Class("UnityEngine", "Transform").GetMethod("get_childCount", 0);
-    if (f_bigHands) {
-        if (!g_bigApplied) {                                       // remember the normal size once
-            g_handScaleL = g_trGetScale[lh]();
-            g_handScaleR = g_trGetScale[rh]();
-            g_bigApplied = true;
-            ym::log("clientdabell: big hands on: normal scale %.2f/%.2f, children %d/%d", g_handScaleL.x, g_handScaleR.x,
-                    childCount.IsValid() ? childCount[lh]() : -1, childCount.IsValid() ? childCount[rh]() : -1);
-        }
-        G.trSetLocalScale[lh](g_handScaleL * 3.0f);                // every frame: the game may set it back
-        G.trSetLocalScale[rh](g_handScaleR * 3.0f);
-    } else if (g_bigApplied) {
-        G.trSetLocalScale[lh](g_handScaleL);
-        G.trSetLocalScale[rh](g_handScaleR);
-        g_bigApplied = false;
-    }
-}
 
 static void OverpoweredOff() {
     for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) { *it.flag = false; if (it.fn) it.fn(); }
@@ -2544,13 +2581,11 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     FlingGunTick(in);
     BounceTick();
     ItemGunTick(in, dt);
-    if (f_bigHands || g_bigApplied) ApplyBigHands();           // every frame while on, and once to put them back
     LongArmsTick();
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
     for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
-    g_bigApplied = false;
     g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
     g_megaPrev = g_poundPrev = g_pounding = g_flingPrev = g_shotPrev = false;
     for (auto &sh : g_shots) { Kill(sh.go); sh.born = -1; }
