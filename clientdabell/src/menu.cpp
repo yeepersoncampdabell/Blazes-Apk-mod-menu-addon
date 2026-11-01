@@ -111,15 +111,6 @@ static struct {
     Method<void> itemDrop, setHeldItem;
     void *(*arrayNew)(void *, uintptr_t) = nullptr;
     void *(*valueBox)(void *, void *) = nullptr;
-    // Room effects: your weather is kept on your Photon player (a custom property), which
-    // every client in the room already receives. ClientDaBell reads it; the game ignores it.
-    BNM::IL2CPP::Il2CppClass *intClass = nullptr;
-    Method<Il2CppObject *> pnLocalPlayer, pnOthers, plGetProps, htGet;
-    Method<BNM::Structures::Mono::String *> plGetNick;
-    Method<void> htSet;
-    MethodBase plSetProps;
-    int plSetPropsArgs = 0;
-    Class htClass;
     Method<bool> behaviourGetEnabled;
     Method<void> behaviourSetEnabled;
     std::vector<BNM::MonoType *> trackerTypes;
@@ -310,38 +301,6 @@ static bool Lookups() {
         ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
                 G.itemKey.IsValid(), G.arrayNew && G.valueBox);
     }
-    {   // room effects (see RoomWxTick)
-        G.intClass = Class("System", "Int32").GetClass();
-        Class pn("Photon.Pun", "PhotonNetwork"), pl("Photon.Realtime", "Player"), ht("ExitGames.Client.Photon", "Hashtable");
-        if (pn.IsValid()) {
-            G.pnLocalPlayer = pn.GetMethod("get_LocalPlayer", 0);
-            G.pnOthers = pn.GetMethod("get_PlayerListOthers", 0);
-        }
-        if (pl.IsValid()) {
-            G.plGetProps = pl.GetMethod("get_CustomProperties", 0);
-            G.plGetNick = pl.GetMethod("get_NickName", 0);
-            for (auto &m : pl.GetMethods(false)) {                    // SetCustomProperties(Hashtable[, expected, webFlags])
-                auto *mi = m.GetInfo();
-                if (!mi || !mi->name || strcmp(mi->name, "SetCustomProperties") != 0) continue;
-                if (mi->parameters_count == 1 || mi->parameters_count == 3) { G.plSetProps = m; G.plSetPropsArgs = mi->parameters_count; }
-            }
-        }
-        if (ht.IsValid()) {
-            G.htClass = ht;
-            // Photon's Hashtable has this[object] (and in some versions this[byte]); look up
-            // through the parent classes too, in case it only inherits the indexer.
-            for (Class c = ht; c.IsValid() && c.GetClass(); ) {
-                if (!G.htSet.IsValid()) G.htSet = Overload(c, "set_Item", {"System.Object", "System.Object"});
-                if (!G.htGet.IsValid()) G.htGet = Overload(c, "get_Item", {"System.Object"});
-                auto *parent = c.GetClass()->parent;
-                if (!parent || (G.htSet.IsValid() && G.htGet.IsValid())) break;
-                c = Class(&parent->byval_arg);
-            }
-        }
-        ym::log("clientdabell: room effects local=%d others=%d props=%d/%d(%d) table=%d/%d", G.pnLocalPlayer.IsValid(),
-                G.pnOthers.IsValid(), G.plGetProps.IsValid(), G.plSetProps.IsValid(), G.plSetPropsArgs,
-                G.htSet.IsValid(), G.htGet.IsValid());
-    }
     Class behaviour("UnityEngine", "Behaviour");
     G.behaviourGetEnabled = behaviour.GetMethod("get_enabled", 0);
     G.behaviourSetEnabled = behaviour.GetMethod("set_enabled", 1);
@@ -487,7 +446,6 @@ static bool g_wxSel[4];             // Effects: Snow, Rain, Thunderstorm, Disco 
 static int g_wx = -1;
 static bool g_todSel[4];            // Effects: Morning, Afternoon, Sunset, Night (pick one)
 static int g_tod = -1;
-static bool f_wxShare = true;      // Effects: send yours to the room and see theirs (ClientDaBell users)
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
@@ -618,7 +576,6 @@ static Item g_items[] = {
     {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
     {EFFECTS, "Sunset", TOGGLE, MAIN, &g_todSel[2], TodPicked},
     {EFFECTS, "Night", TOGGLE, MAIN, &g_todSel[3], TodPicked},
-    {EFFECTS, "Room Effects", TOGGLE, MAIN, &f_wxShare},
 
     {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
     {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
@@ -700,14 +657,13 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Weather, disco and time of day. Others with ClientDaBell see them too."},
+    {"Effects", "Weather, disco and time of day. Only you see and hear them."},
     {"Morning", "Low sun, soft warm light and a little mist."},
     {"Afternoon", "High sun and a bright blue sky."},
     {"Sunset", "An orange sky with the sun on the horizon."},
     {"Night", "Dark sky, moon and stars."},
     {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
-    {"Room Effects", "On: ClientDaBell users in the room see your effects and time of day, and you see theirs."},
-    {"Snow", "Snow falls in the room (for anyone with ClientDaBell)."},
+    {"Snow", "Snow falls around you."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
@@ -786,7 +742,7 @@ static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) g_view.push_back(&it);
+        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -1230,7 +1186,7 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
     g_wx = -1;
@@ -2283,11 +2239,8 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
-// ---- effects: snow, rain, thunderstorm (shared with ClientDaBell users) -------------
-// The effect itself is drawn on each client: only a small number (which effect, how heavy)
-// goes out, as a custom property on your Photon player (see RoomWxTick). Other ClientDaBell
-// users in the room read it and run the same effect around themselves; players without the
-// menu receive the property but the game ignores it, so they see nothing. A fixed pool of small cubes (kMaxFx) falls around your
+// ---- effects: snow, rain, thunderstorm, disco (only you see and hear them) -----------
+// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
 // head and is reused: a piece that lands, or drifts too far away, restarts above you. The
 // pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
 // the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
@@ -2600,93 +2553,9 @@ static void WeatherReset() {                                   // room change: t
     g_wxOn = false;
 }
 
-// ---- room effects sync ------------------------------------------------------------
-// Properties on your player (0 / missing = off):
-//   "cdbWx"  1 + effect * 3 + intensity   (effect 0 snow, 1 rain, 2 storm, 3 disco)
-//   "cdbTod" 1 + time of day              (0 morning, 1 afternoon, 2 sunset, 3 night)
-// Sent only when they change (at most twice a second); others are read once a second.
-static const char *kWxKey = "cdbWx", *kTodKey = "cdbTod";
-static const char *kTodNames[] = {"morning", "afternoon", "sunset", "night"};
-static int g_wxSent = -1, g_roomWx = -1, g_roomWxInt = 1, g_todSent = -1, g_roomTod = -1;
-static double g_nextWxSend = 0, g_nextWxRead = 0;
-static bool g_wxSyncBroken = false;
-
-static int MyWxValue() {
-    if (!f_wxShare || g_wx < 0 || !g_wxSel[g_wx]) return 0;
-    return 1 + g_wx * 3 + g_wxIntensity;
-}
-static int MyTodValue() { return f_wxShare && g_tod >= 0 && g_todSel[g_tod] ? 1 + g_tod : 0; }
-static bool SendProp(const char *key, int v) {
-    Il2CppObject *me = G.pnLocalPlayer.IsValid() ? G.pnLocalPlayer() : nullptr;
-    if (!me || !G.plSetProps.IsValid() || !G.htSet.IsValid() || !G.htClass.IsValid() || !G.valueBox || !G.intClass) return false;
-    Il2CppObject *table = G.htClass.CreateNewObjectParameters();
-    if (!table) return false;
-    // null removes the property for everyone, so nothing is left behind when you switch off
-    void *boxed = v ? G.valueBox(G.intClass, &v) : nullptr;
-    G.htSet[table]((Il2CppObject *)CreateMonoString(key), (Il2CppObject *)boxed);
-    Method<bool> set = G.plSetProps;
-    if (G.plSetPropsArgs == 3) set[me](table, (Il2CppObject *)nullptr, (Il2CppObject *)nullptr);
-    else set[me](table);
-    return true;
-}
-static int ReadProp(Il2CppObject *player, const char *key, int max) {
-    Il2CppObject *props = G.plGetProps[player]();
-    if (!props) return 0;
-    auto *o = (Il2CppObject *)G.htGet[props]((Il2CppObject *)CreateMonoString(key));
-    if (!o || o->klass != G.intClass) return 0;
-    int v = *(int *)((uint8_t *)o + sizeof(Il2CppObject));
-    return v >= 1 && v <= max ? v : 0;
-}
-static void RoomWxTick() {
-    if (g_wxSyncBroken) return;
-    try {
-        int mine = MyWxValue(), myTod = MyTodValue();
-        if ((mine != g_wxSent || myTod != g_todSent) && g_time >= g_nextWxSend) {
-            g_nextWxSend = g_time + 0.5;
-            if (mine != g_wxSent && SendProp(kWxKey, mine)) g_wxSent = mine;
-            if (myTod != g_todSent && SendProp(kTodKey, myTod)) g_todSent = myTod;
-        }
-        if (g_time < g_nextWxRead) return;
-        g_nextWxRead = g_time + 1.0;
-        int found = 0, foundTod = 0;
-        std::string nick, todNick;
-        if (f_wxShare && G.pnOthers.IsValid() && G.plGetProps.IsValid() && G.htGet.IsValid()) {
-            auto *arr = (uint8_t *)G.pnOthers();
-            uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
-            auto NickOf = [](Il2CppObject *pl) {
-                auto *s = G.plGetNick.IsValid() ? G.plGetNick[pl]() : nullptr;
-                std::string n = s ? s->str() : "";
-                return n.empty() ? std::string("Someone") : n;
-            };
-            for (uintptr_t i = 0; i < n && i < 64 && !(found && foundTod); i++) {   // the first player with each one
-                Il2CppObject *pl = ((Il2CppObject **)(arr + 0x20))[i];
-                if (!pl) continue;
-                if (!found && (found = ReadProp(pl, kWxKey, 12))) nick = NickOf(pl);
-                if (!foundTod && (foundTod = ReadProp(pl, kTodKey, 4))) todNick = NickOf(pl);
-            }
-        }
-        int mode = found ? (found - 1) / 3 : -1;
-        if (mode != g_roomWx && mode >= 0 && !(g_wx >= 0 && g_wxSel[g_wx]))
-            Notify("%s started %s", nick.c_str(), mode == 0 ? "snow" : mode == 1 ? "rain" : mode == 2 ? "a thunderstorm" : "a disco");
-        g_roomWx = mode;
-        g_roomWxInt = found ? (found - 1) % 3 : 1;
-        int tod = foundTod ? foundTod - 1 : -1;
-        if (tod != g_roomTod && tod >= 0 && !(g_tod >= 0 && g_todSel[g_tod]))
-            Notify("%s set the time to %s", todNick.c_str(), kTodNames[tod]);
-        g_roomTod = tod;
-    } catch (...) {
-        g_wxSyncBroken = true;                       // don't retry every frame; your own effects still work
-        g_roomWx = -1;
-        g_roomTod = -1;
-        ym::log("clientdabell: room effects error, sharing off for this session");
-    }
-}
-static void RoomWxReset() { g_wxSent = g_todSent = -1; g_roomWx = g_roomTod = -1; g_nextWxSend = g_nextWxRead = 0; }
-
 static void WeatherTick(float dt) {
-    bool own = g_wx >= 0 && g_wxSel[g_wx];
-    int mode = own ? g_wx : g_roomWx;                          // yours wins; else the room's
-    int intensity = own ? g_wxIntensity : g_roomWxInt;
+    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
+    int intensity = g_wxIntensity;
     Il2CppObject *head = g_head.get();
     if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
     if (!EnsureWxRoot()) return;
@@ -2752,8 +2621,8 @@ static void WeatherTick(float dt) {
 
 // ---- time of day: morning, afternoon, sunset, night ------------------------------------
 // Changes the scene's sky, light and fog on your own game, plus a sun or moon and stars of
-// our own (they are what you see for sure, even where the map's lighting is baked). Your
-// pick is shared like the weather (see RoomWxTick). The game's own values are saved the
+// our own (they are what you see for sure, even where the map's lighting is baked). Only
+// you see it; nothing is sent. The game's own values are saved the
 // first time and put back when you switch it off.
 struct TodPreset {
     float az, el;                 // where the sun (or moon) is, in degrees
@@ -2993,8 +2862,7 @@ static void TodReset() {                                           // room chang
     g_nextTodApply = 0;
 }
 static void TodTick() {
-    bool own = g_tod >= 0 && g_todSel[g_tod];
-    int tod = own ? g_tod : g_roomTod;
+    int tod = (g_tod >= 0 && g_todSel[g_tod]) ? g_tod : -1;
     Il2CppObject *head = g_head.get();
     if (tod < 0 || !head) { TodOff(); return; }
     TodInit();
@@ -3448,7 +3316,6 @@ static void OnRoomChange() {
     g_gunLine.clear();
     WeatherReset();
     try { TodReset(); } catch (...) {}
-    RoomWxReset();
     OverpoweredReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
@@ -3507,7 +3374,6 @@ static void OnUpdate(float dt) {
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
-    RoomWxTick();
     try { WeatherTick(dt); }
     catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
     try { TodTick(); }
