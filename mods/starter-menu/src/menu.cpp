@@ -1,4 +1,4 @@
-// Blaze Menu (the starter menu): a hand menu in the style of ii's Stupid Menu (Gorilla Tag).
+// ClientDaBell: a hand menu built from the starter menu (ii's Stupid Menu layout).
 // The layout idea comes from ii's menu; the code is new.
 //   Hold Y (left hand)      -> menu on your left hand, tipped like ii's; turn your palm to you
 //                              (B and the right hand with "Right Hand Menu")
@@ -12,6 +12,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <dirent.h>
+#include <strings.h>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -20,7 +24,8 @@ using namespace BNM;
 using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
-YEEPS_MOD("Blaze Menu")
+YEEPS_MOD("ClientDaBell")
+#define CDB_VERSION "v1.2.2"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -67,6 +72,7 @@ static Color Rainbow(float h) {             // hue 0..1 -> bright color
 // ---- game lookups, resolved once -------------------------------------------
 
 struct XRDevice { uint64_t id; bool initialized; };
+static bool g_customFont = false;       // Londrina Solid loaded from the fonts folder
 static struct {
     bool ok = false;
     Method<Il2CppObject *> createPrimitive, goTransform, goGetComponent, goAddComponent, compTransform, compGameObject;
@@ -82,6 +88,11 @@ static struct {
     Method<XRDevice> deviceAtNode;
     Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
     Method<void> pvRpc;
+    Method<Il2CppObject *> audioClipCreate;           // soundboard
+    Method<bool> audioClipSetData;
+    Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    BNM::MonoType *tAudioSource = nullptr;
+    BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
     BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
     BNM::IL2CPP::Il2CppClass *objectClass = nullptr, *stringClass = nullptr;
     BNM::MonoType *tPhotonView = nullptr, *tItem = nullptr;
@@ -119,7 +130,7 @@ static bool Lookups() {
           sh("UnityEngine", "Shader"), res("UnityEngine", "Resources"), text("UnityEngine.UI", "Text"),
           graphic("UnityEngine.UI", "Graphic"), canvas("UnityEngine", "Canvas"), rt("UnityEngine", "RectTransform"),
           dev("UnityEngine.XR", "InputDevices"), player("", "MasterPlayer", Image("Assembly-CSharp.dll"));
-    if (!go || !tr || !player || !dev) { ym::log("starter-menu: game classes missing"); return false; }
+    if (!go || !tr || !player || !dev) { ym::log("clientdabell: game classes missing"); return false; }
     G.createPrimitive = go.GetMethod("CreatePrimitive", 1);
     G.goTransform = go.GetMethod("get_transform", 0);
     G.goGetComponent = Overload(go, "GetComponent", {"System.Type"});
@@ -130,6 +141,23 @@ static bool Lookups() {
     G.compGameObject = comp.GetMethod("get_gameObject", 0);
     G.destroy = Overload(obj, "Destroy", {"UnityEngine.Object"});
     G.alive = obj.GetMethod("op_Implicit", 1);
+    {
+        Class aclip("UnityEngine", "AudioClip"), asrc("UnityEngine", "AudioSource"), flt("System", "Single");
+        if (flt.IsValid()) G.floatClass = flt.GetClass();
+        if (aclip.IsValid()) {
+            G.audioClipCreate = Overload(aclip, "Create", {"System.String", "System.Int32", "System.Int32", "System.Int32", "System.Boolean"});
+            G.audioClipSetData = aclip.GetMethod("SetData", 2);
+        }
+        if (asrc.IsValid()) {
+            G.tAudioSource = asrc.GetMonoType();
+            G.asSetClip = asrc.GetMethod("set_clip", 1);
+            G.asSetVolume = asrc.GetMethod("set_volume", 1);
+            G.asSetSpatial = asrc.GetMethod("set_spatialBlend", 1);
+            G.asSetLoop = asrc.GetMethod("set_loop", 1);
+            G.asPlay = asrc.GetMethod("Play", 0);
+            G.asStop = asrc.GetMethod("Stop", 0);
+        }
+    }
     G.trSetParent = Overload(tr, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
     G.trSetPosition = tr.GetMethod("set_position", 1);
     G.trSetRotation = tr.GetMethod("set_rotation", 1);
@@ -179,7 +207,7 @@ static bool Lookups() {
     G.plSetVelocity = player.GetMethod("ApplySetVelocityNoHaptic", 1);
     if (!G.plSetVelocity.IsValid()) G.plSetVelocity = player.GetMethod("ApplySetVelocity", 1);
     G.plNoGravityFor = player.GetMethod("ApplyNoGravityDuration", 1);
-    ym::log("starter-menu: velocity %d/%d, no-gravity %d", G.plGetVelocity.IsValid(), G.plSetVelocity.IsValid(),
+    ym::log("clientdabell: velocity %d/%d, no-gravity %d", G.plGetVelocity.IsValid(), G.plSetVelocity.IsValid(),
             G.plNoGravityFor.IsValid());
     G.goSetLayer = go.GetMethod("set_layer", 1);
     G.jumpMultiplier = player.GetField("jumpMultiplier");
@@ -228,7 +256,7 @@ static bool Lookups() {
         G.stringClass = Class("System", "String").GetClass();
         G.arrayNew = (decltype(G.arrayNew))ym::api()->resolve("il2cpp_array_new");
         G.valueBox = (decltype(G.valueBox))ym::api()->resolve("il2cpp_value_box");
-        ym::log("starter-menu: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
+        ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
                 G.itemKey.IsValid(), G.arrayNew && G.valueBox);
     }
     Class behaviour("UnityEngine", "Behaviour");
@@ -254,6 +282,39 @@ static bool Lookups() {
     G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
     for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
         if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
+    // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
+    // files (mods/fonts/). If it is missing or won't load, the game's own font is used.
+    {
+        std::string fpath = std::string(ym::api()->modsDir ? ym::api()->modsDir : "") + "/fonts/LondrinaSolid-Regular.ttf";
+        FILE *ff = fopen(fpath.c_str(), "rb");
+        if (ff) {
+            fclose(ff);
+            try {
+                Class fc("UnityEngine", "Font");
+                Il2CppObject *fo = fc.IsValid() ? fc.CreateNewObjectParameters(CreateMonoString(fpath.c_str())) : nullptr;
+                bool good = fo && G.alive((Il2CppObject *)fo);
+                ym::log("clientdabell: font ctor(path): object=%d alive=%d", fo ? 1 : 0, good ? 1 : 0);
+                if (!good && fc.IsValid()) {                       // second route: empty Font, then load the file into it
+                    Il2CppObject *f2 = fc.CreateNewObjectParameters();
+                    Method<void> load = fc.GetMethod("Internal_CreateFontFromPath", 2);
+                    if (f2 && load.IsValid()) {
+                        load(f2, (BNM::Structures::Mono::String *)CreateMonoString(fpath.c_str()));
+                        fo = f2;
+                        good = G.alive((Il2CppObject *)fo);
+                    }
+                    ym::log("clientdabell: font second route: object=%d loader=%d alive=%d", f2 ? 1 : 0, load.IsValid() ? 1 : 0, good ? 1 : 0);
+                }
+                MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
+                if (good && hasChar.IsValid()) {
+                    Method<bool> hc = hasChar;
+                    bool hasA = hc[fo]((uint16_t)'A');
+                    ym::log("clientdabell: Londrina Solid object created, HasCharacter(A)=%d", (int)hasA);   // not used as a gate: it can read false before first use
+                }
+                if (good) { G.font.set(fo); g_customFont = true; }
+                ym::log("clientdabell: Londrina Solid font %s", good ? "loaded" : "failed, using the game's font");
+            } catch (...) { ym::log("clientdabell: Londrina Solid font error, using the game's font"); }
+        } else ym::log("clientdabell: no font file at %s, using the game's font", fpath.c_str());
+    }
     // Arial, like ii's menu (Unity 6 calls it LegacyRuntime.ttf)
     for (const char *f : {"LegacyRuntime.ttf", "Arial.ttf"})
         if (!G.font.get() && G.builtinResource.IsValid() && G.tFont)
@@ -264,7 +325,7 @@ static bool Lookups() {
     }
     G.ok = G.createPrimitive.IsValid() && G.goTransform.IsValid() && G.trSetPosition.IsValid() &&
            G.deviceAtNode.IsValid() && G.tryGetBool.IsValid() && G.leftHand.IsValid();
-    if (!G.ok) ym::log("starter-menu: some game methods are missing, menu off");
+    if (!G.ok) ym::log("clientdabell: some game methods are missing, menu off");
     return G.ok;
 }
 
@@ -319,7 +380,9 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands, f_flingGun, f_propGun, f_bounce;   // Overpowered
+static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
 static std::vector<PendingItem> g_itemQueue;
@@ -328,6 +391,8 @@ static int g_dupeArmed = 0;
 
 static constexpr int kDances = 8;
 static bool g_danceSel[kDances];
+static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
+static int g_wx = -1;
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
@@ -349,10 +414,25 @@ static void ApplyGravity();
 static void DancePicked();
 static void ArmDupe9();
 static void ArmDupe27();
+static void ArmDupe9x3();
 static bool LeftHandItem();
+static void ScanSongs();
+static void PlaySong();
+static void NextSong();
+static void PrevSong();
+static void StopSound();
+static void ApplyLoop();
+static void NextSoundVolume();
+static void WeatherPicked();
+static void LongArmsToggled();
+static void NextArmLength();
+static void NextJumpPower();
+static void ApplyBigHands();
+static void OverpoweredOff();
+static void NextWeatherIntensity();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SETTINGS, ENABLED, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Settings", "Enabled Mods"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -368,6 +448,9 @@ static Item g_items[] = {
     {MAIN, "Movement Mods", OPEN, MOVEMENT},
     {MAIN, "Rig Mods", OPEN, RIG},
     {MAIN, "Items", OPEN, ITEMS},
+    {MAIN, "Soundboard", OPEN, SOUNDBOARD},
+    {MAIN, "Effects", OPEN, EFFECTS},
+    {MAIN, "Overpowered", OPEN, OVERPOWERED},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
@@ -384,6 +467,7 @@ static Item g_items[] = {
     {MOVEMENT, "Low Gravity", TOGGLE, MAIN, &f_lowGravity},
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
+    {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
 
 
     {RIG, "Exit Rig Mods", OPEN, MAIN},
@@ -400,7 +484,38 @@ static Item g_items[] = {
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
+    {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
+
+    {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
+    {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
+    {SOUNDBOARD, "Next Song", ACTION, MAIN, nullptr, NextSong},
+    {SOUNDBOARD, "Previous Song", ACTION, MAIN, nullptr, PrevSong},
+    {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
+    {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
+    {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
+
+    {EFFECTS, "Exit Effects", OPEN, MAIN},
+    {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
+    {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
+    {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
+    {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
+
+    {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
+    {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
+    {OVERPOWERED, "Arm Length", ACTION, MAIN, nullptr, NextArmLength},
+    {OVERPOWERED, "Super Speed", TOGGLE, MAIN, &f_superSpeed, ApplySpeedBoost},
+    {OVERPOWERED, "Mega Jump", TOGGLE, MAIN, &f_megaJump},
+    {OVERPOWERED, "Jump Power", ACTION, MAIN, nullptr, NextJumpPower},
+    {OVERPOWERED, "Super Fly", TOGGLE, MAIN, &f_superFly},
+    {OVERPOWERED, "Rocket Boots", TOGGLE, MAIN, &f_rocket},
+    {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
+    {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
+    {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
+    {OVERPOWERED, "Fling Gun", TOGGLE, MAIN, &f_flingGun},
+    {OVERPOWERED, "Launch Items Gun", TOGGLE, MAIN, &f_propGun},
+    {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
 
     {SETTINGS, "Exit Settings", OPEN, MAIN},
     {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
@@ -436,7 +551,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Low Gravity", "Jump higher, fall slower."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
-    {"Change Menu Theme", "Blaze, Orange, Blue, Green, Purple, Dark."},
+    {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -445,6 +560,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Spawn Item Gun", "Hold an item in your left hand. Right grip aims, trigger spawns it."},
     {"Duplicate Items (3x3)", "9 of the item in your left hand appear in front of you."},
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
+    {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -454,6 +570,33 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Jumping Jacks", "Arms go up and down at your sides. Hold left trigger."},
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
+    {"Soundboard", "Plays .wav songs from the sounds folder. Only you hear them."},
+    {"Next Song", "Picks the next song in the list."},
+    {"Previous Song", "Picks the previous song in the list."},
+    {"Stop Sound", "Stops the song (and cancels a loading one)."},
+    {"Loop", "Repeats the song until you stop it."},
+    {"Sound Volume", "Quiet, medium or loud."},
+    {"Rescan Songs", "Looks in the sounds folder again."},
+    {"Effects", "Snow, rain and thunderstorms. Only you see and hear them."},
+    {"Snow", "Snow falls around you."},
+    {"Rain", "Rain falls around you."},
+    {"Thunderstorm", "Rain with lightning and thunder."},
+    {"Effect Intensity", "Light, medium or heavy."},
+    {"Overpowered", "The overpowered mods. Two pages."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
+    {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
+    {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
+    {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
+    {"Jump Power", "Small, medium, big or huge jump."},
+    {"Super Fly", "Hold A to rocket where you look."},
+    {"Rocket Boots", "Hold both triggers to shoot upward."},
+    {"Grapple Hook", "Hold either trigger (or both) to swing toward what that hand points at."},
+    {"Ground Pound", "Both grips: mace smash with a shockwave."},
+    {"Launch Items Gun", "Free-hand grip shoots local-only props."},
+    {"Bounce", "Bounce back up every time you land."},
+    {"Fling Gun", "Press A (X) to fling yourself where you point."},
+    {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
+    {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
@@ -469,7 +612,7 @@ static const char *TipFor(const char *label) {
 // Colors in the ii menu style: an animated background and darker buttons when on.
 struct Theme { const char *name; Color bgA, bgB, button, buttonOn, title; };
 static const Theme kThemes[] = {
-    {"Blaze",  Color(0.90f, 0.12f, 0.04f, 1), Color(1.0f, 0.42f, 0.0f, 1), Color(0.50f, 0.06f, 0.03f, 1), Color(1.0f, 0.45f, 0.05f, 1), Color(1.0f, 0.62f, 0.20f, 1)},
+    {"Plush Blue", Color(0.25f, 0.55f, 0.95f, 1), Color(0.42f, 0.72f, 1.0f, 1), Color(0.13f, 0.33f, 0.70f, 1), Color(0.05f, 0.15f, 0.42f, 1), Color(0.82f, 0.93f, 1.0f, 1)},
     {"Orange", Color(1.0f, 0.50f, 0.0f, 1), Color(1.0f, 0.40f, 0.0f, 1), Color(0.67f, 0.33f, 0.0f, 1), Color(0.33f, 0.16f, 0.0f, 1), Color(1.0f, 0.75f, 0.49f, 1)},
     {"Blue",   Color(0.20f, 0.50f, 1.0f, 1), Color(0.10f, 0.30f, 0.85f, 1), Color(0.10f, 0.28f, 0.65f, 1), Color(0.04f, 0.12f, 0.32f, 1), Color(0.70f, 0.85f, 1.0f, 1)},
     {"Green",  Color(0.30f, 0.85f, 0.30f, 1), Color(0.15f, 0.65f, 0.20f, 1), Color(0.12f, 0.45f, 0.12f, 1), Color(0.05f, 0.22f, 0.05f, 1), Color(0.75f, 1.0f, 0.75f, 1)},
@@ -486,6 +629,7 @@ static const Theme &T() { return kThemes[g_theme]; }
 // on a "board" object: +x goes across, +y goes up, the player looks at it from -z.
 static constexpr int kRows = 8;                                   // buttons per page
 static const float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
+static const float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
 static const float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
 static float RowY(int r) { return 0.13f - r * 0.04f; }
 
@@ -500,6 +644,7 @@ static int g_page = 0;
 static std::vector<Item *> g_view;                                // what the current page list shows
 static double g_time = 0, g_nextPress = 0, g_notifyUntil = 0, g_nextTitle = 0;
 static int g_touching = -2, g_frames = 0;
+static Ref g_homeCube, g_homeLabel;
 static float g_fps = 0;
 
 static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
@@ -530,7 +675,7 @@ static Il2CppObject *Label(Il2CppObject *canvasT, const char *s, Vector3 pos, fl
     G.textSetText[text](CreateMonoString(s));
     G.textSetFontSize[text](size);
     G.textSetAlignment[text](4);                 // MiddleCenter
-    if (G.textSetFontStyle.IsValid()) G.textSetFontStyle[text](2);   // Italic, like ii's menu
+    if (G.textSetFontStyle.IsValid()) G.textSetFontStyle[text](g_customFont ? 0 : 2);   // Londrina is already chunky; the fallback font is italic
     if (G.textSetBestFit.IsValid()) {            // shrink long labels to fit their button
         G.textSetBestFit[text](true);
         G.textSetMinSize[text](1);
@@ -582,12 +727,79 @@ static void PointerToHand() {
 }
 static void NextPointer() { g_pointerSpot = (g_pointerSpot + 1) % 4; PointerToHand(); Notify("Pointer position %d", g_pointerSpot + 1); }
 
+// ---- Yeeps decorations: candy-cane border, candy canes, pumpkins ------------------------
+// Plain primitives with no colliders, parented to the board, built once with the menu and
+// destroyed with it. A hard cap (kMaxDecor) keeps the object count fixed.
+static constexpr int kMaxDecor = 72;
+static int g_decorN = 0;
+static Quaternion RotZ(float rad) { return Quaternion(0, 0, sinf(rad * 0.5f), cosf(rad * 0.5f)); }
+// prim: 0 sphere, 2 cylinder, 3 cube. Positions are in the board's own space.
+static void Decor(Il2CppObject *boardT, int prim, Color c, Vector3 pos, Vector3 scale, float roll = 0) {
+    if (g_decorN >= kMaxDecor) return;
+    Il2CppObject *o = Prim(prim, c, false);
+    if (!o) return;
+    g_decorN++;
+    Il2CppObject *t = Tr(o);
+    G.trSetParent[t](boardT, false);
+    G.trSetLocalPosition[t](pos);
+    G.trSetLocalRotation[t](RotZ(roll));
+    G.trSetLocalScale[t](scale);
+}
+static void CandyCane(Il2CppObject *bt, float x, float y, float dir) {      // dir +1: the hook bends toward +x
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float z = -0.02f, h = 0.08f, d = 0.012f, R = 0.014f;
+    Decor(bt, 2, white, Vector3(x, y, z), Vector3(d, h / 2, d));
+    for (int i = 0; i < 3; i++)
+        Decor(bt, 2, red, Vector3(x, y - 0.024f + i * 0.024f, z), Vector3(d * 1.07f, 0.005f, d * 1.07f));
+    const float top = y + h / 2;
+    for (int k = 1; k <= 4; k++) {                                         // the hook: half a circle of balls
+        float a = 3.14159265f * 0.25f * k;
+        Decor(bt, 0, k % 2 ? red : white, Vector3(x + dir * (R - R * cosf(a)), top + R * sinf(a), z), Vector3(d, d, d));
+    }
+}
+static void Pumpkin(Il2CppObject *bt, float x, float y) {
+    const Color orange(1.0f, 0.45f, 0.05f, 1), dark(0.78f, 0.28f, 0.02f, 1), green(0.2f, 0.6f, 0.15f, 1), face(0.08f, 0.04f, 0.0f, 1);
+    const float z = -0.02f, front = z - 0.0245f;
+    Decor(bt, 0, dark, Vector3(x - 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));      // ribs behind
+    Decor(bt, 0, dark, Vector3(x + 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));
+    Decor(bt, 0, orange, Vector3(x, y, z), Vector3(0.05f, 0.042f, 0.05f));                       // body
+    Decor(bt, 3, green, Vector3(x + 0.002f, y + 0.025f, z), Vector3(0.008f, 0.014f, 0.008f), 0.3f);   // stem
+    Decor(bt, 3, face, Vector3(x - 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);   // eyes
+    Decor(bt, 3, face, Vector3(x + 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);
+    Decor(bt, 3, face, Vector3(x, y - 0.009f, front), Vector3(0.022f, 0.006f, 0.004f));          // mouth
+}
+static void BuildDecor(Il2CppObject *bt) {
+    g_decorN = 0;
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float hw = kBoardW / 2 + 0.004f, hh = kBoardH / 2 + 0.004f, bar = 0.008f, z = -0.002f;
+    // Candy-cane border: four white bars with red stripes across them
+    Decor(bt, 3, white, Vector3(0, hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(0, -hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(-hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    Decor(bt, 3, white, Vector3(hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    for (int i = 0; i < 6; i++) {
+        float x = -kBoardW / 2 + (i + 0.5f) * (kBoardW / 6);
+        Decor(bt, 3, red, Vector3(x, hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(x, -hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+    }
+    for (int i = 0; i < 8; i++) {
+        float y = -kBoardH / 2 + (i + 0.5f) * (kBoardH / 8);
+        Decor(bt, 3, red, Vector3(-hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+    }
+    CandyCane(bt, -kSideX, kTitleY, 1);
+    CandyCane(bt, kSideX, kTitleY, -1);
+    Pumpkin(bt, -kSideX, -0.215f);
+    Pumpkin(bt, kSideX, -0.215f);
+    ym::log("clientdabell: %d decorations", g_decorN);
+}
+
 // Built once per room; afterwards only shown/hidden, moved and relabeled.
 static void BuildMenu() {
     auto NewObject = [](const char *name) {
         return Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString(name));
     };
-    Il2CppObject *menu = NewObject("BlazeMenu"), *board = NewObject("BlazeMenuBoard");
+    Il2CppObject *menu = NewObject("ClientDaBellMenu"), *board = NewObject("ClientDaBellMenuBoard");
     if (!menu || !board) return;
     g_menu.set(menu);
     g_board.set(board);
@@ -605,19 +817,20 @@ static void BuildMenu() {
     // The title sits on its own dark bar above the board (where ii's Disconnect button was)
     g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
     g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
+    g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
 
     if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
         Il2CppObject *ct = Tr(canvas);
-        Label(ct, "Blaze", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
         for (int r = 0; r < kRows; r++)
             g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
-        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.02f, 0), kBoardW + 0.1f, 0.03f, 15, &g_tipText);
-        char ver[64];
-        snprintf(ver, sizeof ver, "Blaze build %s", ym::api()->gameVersion);
-        Label(ct, ver, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
+        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, 19, nullptr));
+        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.09f, 0), kBoardW, 0.03f, 17, &g_tipText);
+        Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
+    BuildDecor(bt);
     // Pointer: a small ball on the index finger of the other hand
     if (Il2CppObject *p = Prim(0, T().bgB, false)) {
         G.trSetLocalScale[Tr(p)](Vector3(0.01f, 0.01f, 0.01f));
@@ -668,6 +881,9 @@ static void RenderPage() {
     Show(g_next, pages);
     SetColor(g_prev.get(), T().button);
     SetColor(g_next.get(), T().button);
+    Show(g_homeCube, g_cat != MAIN);
+    Show(g_homeLabel, g_cat != MAIN);
+    SetColor(g_homeCube.get(), g_flashRow == -3 ? Color(1, 0.9f, 0.6f, 1) : T().button);
     SetColor(g_outline.get(), T().title);
     SetColor(g_titleBar.get(), T().buttonOn);
     SetColor(g_pointer.get(), T().bgB);
@@ -678,15 +894,15 @@ static void RenderPage() {
 
 static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
 
-// The title is "Blaze" with a moving red-orange-yellow gradient, one color per letter
+// The title is "ClientDaBell" with a moving plush-blue gradient, one color per letter
 // (rich text). Rebuilt ten times a second, not every frame.
 static void UpdateTitle() {
     if (g_time < g_nextTitle) return;
     g_nextTitle = g_time + 0.1;
-    static const Color kFire[] = {Color(1, 0.1f, 0.05f, 1), Color(1, 0.45f, 0, 1), Color(1, 0.8f, 0.2f, 1), Color(1, 0.45f, 0, 1)};
-    char buf[512];
+    static const Color kFire[] = {Color(0.20f, 0.50f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1), Color(0.85f, 0.95f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1)};   // plush blue shimmer
+    char buf[1024];
     int n = 0;
-    const char *word = "Blaze";
+    const char *word = "ClientDaBell";
     for (int i = 0; word[i]; i++) {
         float t = (float)g_time * 1.5f - i * 0.35f;
         Color c;
@@ -751,6 +967,7 @@ static void Press(Item *it) {
     case OPEN:
         g_cat = it->target;
         g_page = 0;
+        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -762,7 +979,7 @@ static void Press(Item *it) {
         break;
     }
     g_dirty = true;
-    ym::log("starter-menu: %s", it->label);
+    ym::log("clientdabell: %s", it->label);
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
@@ -771,6 +988,7 @@ static int Touching() {
     if (!Alive(board) || !Alive(pointer)) return -2;
     Vector3 p = G.trInverseTransformPoint[Tr(board)](G.trGetPosition[Tr(pointer)]());
     if (p.z < -0.035f || p.z > 0.015f) return -2;
+    if (g_cat != MAIN && fabsf(p.x) < kHomeW / 2 && fabsf(p.y - kHomeY) < kHomeH / 2) return -3;
     if (fabsf(fabsf(p.x) - kSideX) < kSideW / 2 && fabsf(p.y) < kSideH / 2 && PageCount() > 1)
         return p.x < 0 ? -1 : kRows;
     if (fabsf(p.x) >= kBtnW / 2) return -2;
@@ -796,7 +1014,12 @@ static void CheckPress() {
         g_nextPress = g_time + 0.25;
         Buzz();
         if (hit >= 0 && hit < kRows) { g_flashRow = hit; g_flashUntil = g_time + 0.12; }
-        if (hit == -1 || hit == kRows) {
+        if (hit == -3) {                                  // Home: back to the main page
+            g_cat = MAIN;
+            g_page = 0;
+            g_flashRow = -3; g_flashUntil = g_time + 0.12;
+            g_dirty = true;
+        } else if (hit == -1 || hit == kRows) {
             int n = PageCount();
             g_page = (g_page + (hit == kRows ? 1 : n - 1)) % n;
             g_dirty = true;
@@ -877,6 +1100,8 @@ static void AllOff() {
     for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
+    g_wx = -1;
+    StopSound();
     g_itemQueue.clear();
     PointerToHand();
     Notify("Everything off");
@@ -912,7 +1137,7 @@ static void PlatformFor(bool held, Ref &platform, Ref &hand) {
         layer = -1;
         int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : 0;
         for (int i = 0; i < 32 && layer < 0; i++) if (mask & (1 << i)) layer = i;
-        ym::log("starter-menu: hand layers 0x%x, platforms on layer %d", mask, layer);
+        ym::log("clientdabell: hand layers 0x%x, platforms on layer %d", mask, layer);
     }
     if (layer >= 0 && G.goSetLayer.IsValid()) G.goSetLayer[p](layer);
     Il2CppObject *t = Tr(p);
@@ -972,21 +1197,30 @@ static float g_oldJumpSpeed = 0, g_oldJumpMultiplier = 0;
 static Il2CppObject *g_boosted = nullptr;      // which player has the boost (compared only)
 static bool g_gravityOff = false;
 
+static int g_boostLevel = 0;                   // 1 = Speed Boost, 2 = Super Speed
 static void ApplySpeedBoost() {
     Il2CppObject *player = g_player.get();
     bool ok = G.maxJumpSpeed.IsValid() && G.jumpMultiplier.IsValid();
-    if (f_speedBoost && ok && player && g_boosted != player) {
-        g_oldJumpSpeed = G.maxJumpSpeed[player]();
-        g_oldJumpMultiplier = G.jumpMultiplier[player]();
-        G.maxJumpSpeed[player] = 9.0f;
-        G.jumpMultiplier[player] = 1.5f;
-        g_boosted = player;
-    } else if (!f_speedBoost && g_boosted) {
+    int level = f_superSpeed ? 2 : f_speedBoost ? 1 : 0;
+    if (level && ok && player) {
+        if (g_boosted != player) {                 // first time on this player: remember the normal values
+            g_oldJumpSpeed = G.maxJumpSpeed[player]();
+            g_oldJumpMultiplier = G.jumpMultiplier[player]();
+            g_boosted = player;
+            g_boostLevel = 0;
+        }
+        if (g_boostLevel != level) {
+            G.maxJumpSpeed[player] = level == 2 ? 20.0f : 9.0f;
+            G.jumpMultiplier[player] = level == 2 ? 3.0f : 1.5f;
+            g_boostLevel = level;
+        }
+    } else if (!level && g_boosted) {
         if (ok && player == g_boosted) {
             G.maxJumpSpeed[player] = g_oldJumpSpeed;
             G.jumpMultiplier[player] = g_oldJumpMultiplier;
         }
         g_boosted = nullptr;
+        g_boostLevel = 0;
     }
 }
 
@@ -1061,7 +1295,7 @@ static void NoclipTick(const Buttons &in) {
         for (int l = 0; l < 32; l++)
             if (mask & (1 << l)) G.ignoreLayers(g_bodyLayer, l, want);
     PlayerColliders(want);
-    if (want) ym::log("starter-menu: noclip on (layers 0x%x, body layer %d, %d colliders off)", mask, g_bodyLayer, g_noclipOffN);
+    if (want) ym::log("clientdabell: noclip on (layers 0x%x, body layer %d, %d colliders off)", mask, g_bodyLayer, g_noclipOffN);
 }
 
 // Teleport Gun: hold right grip to aim (a line and a ball show where you land), press
@@ -1080,7 +1314,7 @@ static void TeleportGunTick(const Buttons &in) {
     if (!hand || !G.raycast.IsValid() || !G.lrSetPosition.IsValid()) return;
     if (!g_gunBall.get()) {                              // made once per room
         Il2CppObject *ball = Prim(0, T().bgB, false);
-        Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("BlazeGunLine"));
+        Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGunLine"));
         Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
         if (!ball || !line) return;
         G.trSetLocalScale[Tr(ball)](Vector3(0.1f, 0.1f, 0.1f));
@@ -1174,7 +1408,7 @@ static void DanceTick(const Buttons &in, float dt) {
     if (want != g_dancing) {
         PauseTrackers(want);
         g_dancing = want;
-        if (want) ym::log("starter-menu: dancing, paused %d trackers", g_pausedN);
+        if (want) ym::log("clientdabell: dancing, paused %d trackers", g_pausedN);
     }
     if (!want) return;
     Vector3 hp = G.trGetPosition[head](), f = Flat(G.trGetForward[head]()), up(0, 1, 0);
@@ -1307,7 +1541,7 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
             if (tn.size() > 30) tn = k && k->byval_arg.valuetype ? (k->enumtype ? "enum" : "struct" + std::to_string(k->instance_size - 16)) : "class";
             sig += (i ? "," : "") + tn;
         }
-        ym::log("starter-menu: item message takes %s", sig.c_str());
+        ym::log("clientdabell: item message takes %s", sig.c_str());
     }
     try {
         G.pvRpc[pv](CreateMonoString("RpcCreateItem"), 0, args);      // 0 = everyone in the room
@@ -1315,7 +1549,7 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         auto *ex = w.ex;
         auto *msg = ex ? (BNM::Structures::Mono::String *)ex->message : nullptr;
         auto *cls = ex ? (BNM::Structures::Mono::String *)ex->className : nullptr;
-        ym::log("starter-menu: item message error %s: %s", cls ? cls->str().c_str() : "?", msg ? msg->str().c_str() : "?");
+        ym::log("clientdabell: item message error %s: %s", cls ? cls->str().c_str() : "?", msg ? msg->str().c_str() : "?");
         return false;
     }
     return true;
@@ -1334,24 +1568,26 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel);
         static int logged = 0;
-        if (logged++ < 3) ym::log("starter-menu: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
+        if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
     }
 }
 
-// The grid in front of you: 3 across, 3 deep, and 3 high for 3x3x3.
-static void SpawnGrid(int count) {
+// A grid in front of you: w across, d deep, h high. Never more than 27 in one batch (AGENTS.md),
+// and QueueItems adds the 3 second cooldown and the cap on how many wait.
+static void SpawnGridDims(int w, int d, int h) {
     Il2CppObject *head = g_head.get();
-    if (!head) return;
+    if (!head || w < 1 || d < 1 || h < 1 || w * d * h > 27) return;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 base = G.trGetPosition[head]() + f * 1.2f + Vector3(0, -0.4f, 0);
     std::vector<PendingItem> list;
-    for (int y = 0; y < (count > 9 ? 3 : 1); y++)
-        for (int z = 0; z < 3; z++)
-            for (int x = 0; x < 3; x++)
-                list.push_back({base + r * ((x - 1) * 0.45f) + f * (z * 0.45f) + Vector3(0, y * 0.45f, 0), Vector3(0, 0, 0)});
+    for (int y = 0; y < h; y++)
+        for (int z = 0; z < d; z++)
+            for (int x = 0; x < w; x++)
+                list.push_back({base + r * ((x - (w - 1) * 0.5f) * 0.45f) + f * (z * 0.45f) + Vector3(0, y * 0.45f, 0), Vector3(0, 0, 0)});
     QueueItems(list);
 }
+static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   // 3x3 or 3x3x3
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
 static bool LeftHandItem() {
@@ -1377,6 +1613,7 @@ static bool LeftHandItem() {
 }
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
 static void ArmDupe27() { if (LeftHandItem()) SpawnGrid(27); }
+static void ArmDupe9x3() { if (LeftHandItem()) SpawnGridDims(9, 3, 1); }   // 27 in a row of 9, three deep
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
@@ -1390,16 +1627,938 @@ static void SpawnOnHandTick(const Buttons &in) {
     g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
 }
 
+// ---- soundboard: songs you copy onto the headset ----------------------------------------
+// Put .wav files in a folder named "sounds" next to the .so files in the mods folder
+// (Android/data/com.TrassGames.Yeeps/files/mods/sounds/). Open Soundboard, pick a song, press
+// Play. Only you hear it: it plays on an audio source on your head, nothing is sent.
+// WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
+// the game never stalls, and mixed down to mono to save memory.
+static constexpr int kMaxSongs = 64;
+static constexpr uint64_t kMaxFrames = 12000000;       // about 4.5 minutes at 44.1 kHz
+static constexpr uint32_t kChunkFrames = 32768;        // frames read per game frame
+static std::vector<std::string> g_songs;
+static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
+static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
+static const char *kSoundVolNames[] = {"quiet", "medium", "loud"};
+static Ref g_audioGo, g_audioSrc, g_clip, g_chunk;
+
+struct Loader {
+    FILE *f = nullptr;
+    int channels = 0, bits = 0, fmt = 0;               // fmt 1 = whole numbers, 3 = floating point
+    uint32_t rate = 0, block = 0;
+    uint64_t frames = 0, done = 0;
+    int song = -1, lastTen = -1;
+    bool playWhenDone = false;
+    std::vector<uint8_t> buf;
+} g_load;
+
+static uint32_t U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t U16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static std::string SongsDir() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : "") + "/sounds";
+}
+static std::string SongTitle(int i) {
+    if (i < 0 || i >= (int)g_songs.size()) return "";
+    std::string n = g_songs[i];
+    return n.size() > 4 ? n.substr(0, n.size() - 4) : n;
+}
+static void UpdateSoundLabel() {
+    if (g_songs.empty()) snprintf(g_soundLabel, sizeof g_soundLabel, "Play: (no songs)");
+    else snprintf(g_soundLabel, sizeof g_soundLabel, "Play %d/%d: %.14s", g_songSel + 1, (int)g_songs.size(), SongTitle(g_songSel).c_str());
+    g_dirty = true;
+}
+static void ScanSongs() {
+    g_songs.clear();
+    g_songSel = 0;
+    std::string dir = SongsDir();
+    DIR *d = opendir(dir.c_str());
+    if (!d) {
+        ym::log("clientdabell: no sounds folder at %s", dir.c_str());
+        UpdateSoundLabel();
+        Notify("Make a folder called sounds in your mods folder");
+        return;
+    }
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".wav") == 0 && (int)g_songs.size() < kMaxSongs) g_songs.push_back(n);
+    }
+    closedir(d);
+    std::sort(g_songs.begin(), g_songs.end());
+    UpdateSoundLabel();
+    ym::log("clientdabell: found %d songs", (int)g_songs.size());
+    Notify(g_songs.empty() ? "No .wav files in the sounds folder" : "%d songs found", (int)g_songs.size());
+}
+
+// Reads the WAV header and leaves the file positioned at the first sample.
+static bool OpenWav(const std::string &path, Loader &L, const char **err) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) { *err = "Couldn't open that file"; return false; }
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) {
+        fclose(f); *err = "That isn't a WAV file"; return false;
+    }
+    bool haveFmt = false, haveData = false;
+    uint32_t dataBytes = 0;
+    long dataStart = 0;
+    uint8_t ch[8];
+    while (fread(ch, 1, 8, f) == 8) {
+        uint32_t size = U32(ch + 4);
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            uint8_t fm[40] = {};
+            size_t n = size < 40 ? size : 40;
+            if (fread(fm, 1, n, f) != n || n < 16) break;
+            L.fmt = U16(fm);
+            L.channels = U16(fm + 2);
+            L.rate = U32(fm + 4);
+            L.bits = U16(fm + 14);
+            if (L.fmt == 0xFFFE && n >= 26) L.fmt = U16(fm + 24);     // "extensible": real format inside
+            haveFmt = true;
+            if (size > n || (size & 1)) fseek(f, (long)(size - n) + (long)(size & 1), SEEK_CUR);
+        } else if (memcmp(ch, "data", 4) == 0) {
+            dataBytes = size;
+            dataStart = ftell(f);
+            haveData = true;
+            break;
+        } else {
+            fseek(f, (long)size + (long)(size & 1), SEEK_CUR);
+        }
+    }
+    if (!haveFmt || !haveData) { fclose(f); *err = "Couldn't read that WAV"; return false; }
+    bool okFmt = (L.fmt == 1 && (L.bits == 8 || L.bits == 16 || L.bits == 24 || L.bits == 32)) || (L.fmt == 3 && L.bits == 32);
+    if (!okFmt || L.channels < 1 || L.channels > 8 || L.rate < 8000 || L.rate > 192000) {
+        fclose(f); *err = "Unsupported WAV (use 16-bit PCM)"; return false;
+    }
+    L.block = (uint32_t)L.channels * (uint32_t)(L.bits / 8);
+    fseek(f, 0, SEEK_END);
+    long fileEnd = ftell(f);
+    if (dataBytes == 0 || dataBytes == 0xFFFFFFFFu || dataStart + (long)dataBytes > fileEnd) dataBytes = (uint32_t)(fileEnd - dataStart);
+    fseek(f, dataStart, SEEK_SET);
+    L.frames = dataBytes / L.block;
+    L.f = f;
+    return true;
+}
+
+static void AbortLoad() {
+    if (g_load.f) fclose(g_load.f);
+    g_load.f = nullptr;
+    g_load.buf.clear();
+    g_load.buf.shrink_to_fit();
+    g_chunk.clear();
+}
+
+static bool EnsureAudioSource() {
+    if (Alive(g_audioGo.get()) && Alive(g_audioSrc.get())) return true;
+    if (!G.tAudioSource || !G.asPlay.IsValid() || !G.asSetClip.IsValid() || !g_head.get()) return false;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellAudio"));
+    Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+    if (!src) return false;
+    Il2CppObject *t = Tr(go);
+    G.trSetParent[t](g_head.get(), false);
+    G.trSetLocalPosition[t](Vector3(0, 0, 0));
+    g_audioGo.set(go);
+    g_audioSrc.set(src);
+    return true;
+}
+
+static void PlayLoaded() {
+    if (!EnsureAudioSource() || !Alive(g_clip.get())) { Notify("Couldn't start the sound"); return; }
+    Il2CppObject *src = g_audioSrc.get();
+    G.asSetClip[src](g_clip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+    G.asPlay[src]();
+    Notify("Playing %.30s", SongTitle(g_clipSong).c_str());
+}
+
+static void StartLoad(int song, bool playAfter) {
+    if (!G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) {
+        ym::log("clientdabell: soundboard missing: create=%d setdata=%d array=%d", G.audioClipCreate.IsValid(), G.audioClipSetData.IsValid(), G.arrayNew != nullptr);
+        Notify("Soundboard isn't available in this game");
+        return;
+    }
+    Loader L;
+    const char *err = "";
+    if (!OpenWav(SongsDir() + "/" + g_songs[song], L, &err)) { Notify("%s", err); return; }
+    if (L.frames == 0) { fclose(L.f); Notify("That song is empty"); return; }
+    if (L.frames > kMaxFrames) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
+    g_clip.clear();
+    g_clipSong = -1;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.frames, 1, (int)L.rate, false);
+    Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
+    if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
+    g_clip.set(clip);
+    g_chunk.set(chunk);
+    L.buf.resize((size_t)kChunkFrames * L.block);
+    L.song = song;
+    L.playWhenDone = playAfter;
+    g_load = std::move(L);
+    ym::log("clientdabell: loading %s (%llu frames, %d ch, %d bit, %u Hz)", g_songs[song].c_str(), (unsigned long long)g_load.frames,
+            g_load.channels, g_load.bits, g_load.rate);
+    Notify("Loading %.30s", SongTitle(song).c_str());
+}
+
+// Called every frame: reads the next slice of the song into the clip (about 32k frames).
+static void LoadTick() {
+    Loader &L = g_load;
+    if (!L.f) return;
+    Il2CppObject *clip = g_clip.get();
+    if (!Alive(clip)) { AbortLoad(); return; }
+    uint64_t want = L.frames - L.done < kChunkFrames ? L.frames - L.done : kChunkFrames;
+    size_t got = fread(L.buf.data(), 1, (size_t)(want * L.block), L.f);
+    uint64_t n = got / L.block;
+    if (n > 0) {
+        Il2CppObject *arr = n == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+        if (!arr) { AbortLoad(); Notify("Not enough memory for that song"); return; }
+        float *dst = (float *)((uint8_t *)arr + 0x20);
+        const int bytes = L.bits / 8;
+        const float inv = 1.0f / (float)L.channels;
+        for (uint64_t i = 0; i < n; i++) {
+            const uint8_t *p = L.buf.data() + i * L.block;
+            float sum = 0;
+            for (int c = 0; c < L.channels; c++) {
+                const uint8_t *q = p + c * bytes;
+                float v;
+                if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
+                else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
+                else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
+                else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
+                else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
+                sum += v;
+            }
+            dst[i] = sum * inv;
+        }
+        G.audioClipSetData[clip](arr, (int)L.done);
+        L.done += n;
+        int ten = (int)(L.done * 10 / L.frames);
+        if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+    }
+    if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
+        bool play = L.playWhenDone;
+        int song = L.song;
+        AbortLoad();
+        g_clipSong = song;
+        if (play) PlayLoaded();
+    }
+}
+
+static void PlaySong() {
+    if (g_songs.empty()) { Notify("Put .wav files in the sounds folder, then Rescan"); return; }
+    if (g_load.f) { Notify("Still loading, one moment"); return; }
+    if (g_clipSong == g_songSel && Alive(g_clip.get())) PlayLoaded();
+    else StartLoad(g_songSel, true);
+}
+static void NextSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void PrevSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + (int)g_songs.size() - 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void StopSound() {
+    AbortLoad();
+    if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+}
+static void ApplyLoop() {
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+}
+static void NextSoundVolume() {
+    g_soundVol = (g_soundVol + 1) % 3;
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
+}
+
+// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
+// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
+// head and is reused: a piece that lands, or drifts too far away, restarts above you. The
+// pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
+// the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
+// dim flash of light, and a thunder rumble that is made from noise in code, once.
+static constexpr int kMaxFx = 100;
+static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
+static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
+static int g_wxIntensity = 1;
+static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
+static Vector3 g_fxPos[kMaxFx];
+static float g_fxPhase[kMaxFx];
+static int g_fxMade = 0, g_fxMode = -1, g_fxShown = -1;
+static float g_groundY = 0;
+static double g_nextGround = 0, g_nextBolt = 0, g_boltHideAt = 0, g_flashAt = 0, g_thunderAt = 0;
+static bool g_wxOn = false;
+static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
+
+static void WeatherPicked() {
+    int picked = -1;
+    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
+    g_wx = picked;
+}
+static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
+
+static bool EnsureWxRoot() {
+    if (Alive(g_wxRoot.get())) return true;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellWeather"));
+    if (!go) return false;
+    g_wxRoot.set(go);
+    return true;
+}
+static void RespawnFx(int i, Vector3 head, bool anywhere) {
+    float a = Rand01() * 6.2831853f, r = 4.0f * sqrtf(Rand01());
+    float top = head.y + 3.0f;
+    float y = anywhere ? g_groundY + Rand01() * (top - g_groundY) : head.y + 2.0f + Rand01() * 1.5f;
+    g_fxPos[i] = Vector3(head.x + cosf(a) * r, y, head.z + sinf(a) * r);
+    g_fxPhase[i] = Rand01() * 6.2831853f;
+}
+static void StyleFx(int i, int mode) {
+    Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
+    if (!Alive(o) || !t) return;
+    if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
+    else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
+}
+
+// Thunder: low-passed noise with a quick attack and a long tail, plus a low thump.
+static void BuildThunderClip() {
+    if (Alive(g_wxClip.get()) || !G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) return;
+    const int rate = 22050, n = rate * 3;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString("ClientDaBellThunder"), n, 1, rate, false);
+    Il2CppObject *arr = (Il2CppObject *)G.arrayNew(G.floatClass, n);
+    if (!clip || !arr) return;
+    float *d = (float *)((uint8_t *)arr + 0x20);
+    float lp = 0, lp2 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / rate, noise = Rand01() * 2 - 1;
+        lp += (noise - lp) * 0.04f;
+        lp2 += (lp - lp2) * 0.15f;
+        float env = t < 0.04f ? t / 0.04f : expf(-(t - 0.04f) * 1.3f);
+        float crack = t < 0.5f ? noise * 0.25f * expf(-t * 9.0f) : 0.0f;
+        float thump = sinf(6.2831853f * 48.0f * t) * 0.35f * expf(-t * 1.8f);
+        float v = (lp2 * 4.0f + thump * 0.7f + crack * 0.7f) * env;
+        d[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    }
+    G.audioClipSetData[clip](arr, 0);
+    g_wxClip.set(clip);
+}
+static void PlayThunder() {
+    if (!Alive(g_wxClip.get()) || !G.tAudioSource || !G.asPlay.IsValid() || !g_head.get()) return;
+    if (!Alive(g_wxAudioGo.get()) || !Alive(g_wxAudioSrc.get())) {
+        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellThunderAudio"));
+        Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+        if (!src) return;
+        G.trSetParent[Tr(go)](g_head.get(), false);
+        G.trSetLocalPosition[Tr(go)](Vector3(0, 0, 0));
+        g_wxAudioGo.set(go);
+        g_wxAudioSrc.set(src);
+    }
+    Il2CppObject *src = g_wxAudioSrc.get();
+    G.asSetClip[src](g_wxClip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](false);
+    G.asPlay[src]();
+}
+static void EnsureStorm() {
+    if (!EnsureWxRoot()) return;
+    if (!Alive(g_wxLight.get())) {
+        Class light("UnityEngine", "Light");
+        Il2CppObject *go = light.IsValid() ? Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellLightning")) : nullptr;
+        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+        if (l) {
+            g_lightType = light.GetMethod("set_type", 1);
+            g_lightIntensity = light.GetMethod("set_intensity", 1);
+            g_lightRange = light.GetMethod("set_range", 1);
+            g_lightColor = light.GetMethod("set_color", 1);
+            G.trSetParent[Tr(go)](Tr(g_wxRoot.get()), false);
+            if (g_lightType.IsValid()) g_lightType[l](2);                     // a point light
+            if (g_lightRange.IsValid()) g_lightRange[l](80.0f);
+            if (g_lightColor.IsValid()) g_lightColor[l](Color(0.8f, 0.85f, 1.0f, 1));
+            if (g_lightIntensity.IsValid()) g_lightIntensity[l](0.0f);
+            G.behaviourSetEnabled[l](false);
+            g_wxLight.set(l);
+        }
+    }
+    for (int i = 0; i < 7; i++) {
+        if (Alive(g_bolt[i].get())) continue;
+        Il2CppObject *o = Prim(3, Color(0.92f, 0.95f, 1.0f, 1), false);
+        if (!o) continue;
+        G.trSetParent[Tr(o)](Tr(g_wxRoot.get()), false);
+        G.goSetActive[o](false);
+        g_bolt[i].set(o);
+    }
+    BuildThunderClip();
+}
+static void StrikeBolt(Vector3 head) {
+    float ang = Rand01() * 6.2831853f, dist = 25.0f + Rand01() * 30.0f;
+    Vector3 base(head.x + cosf(ang) * dist, g_groundY, head.z + sinf(ang) * dist), pts[8];
+    float jx = 0, jz = 0;
+    for (int i = 0; i < 8; i++) {                       // a jagged line from the sky to the ground
+        float k = i / 7.0f;
+        if (i > 0 && i < 7) { jx += (Rand01() - 0.5f) * 7.0f; jz += (Rand01() - 0.5f) * 7.0f; }
+        pts[i] = Vector3(base.x + jx * (1 - k), base.y + (1 - k) * 45.0f, base.z + jz * (1 - k));
+    }
+    for (int i = 0; i < 7; i++) {
+        Il2CppObject *o = g_bolt[i].get();
+        if (!Alive(o)) continue;
+        Vector3 dv = pts[i + 1] - pts[i], mid = (pts[i] + pts[i + 1]) * 0.5f;
+        float len = sqrtf(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+        if (len < 0.01f) continue;
+        Il2CppObject *t = Tr(o);
+        G.trSetPosition[t](mid);
+        G.trSetRotation[t](Quaternion::LookRotation(dv));
+        G.trSetLocalScale[t](Vector3(0.8f, 0.8f, len));
+        G.goSetActive[o](true);
+    }
+    g_boltHideAt = g_time + 0.22;
+    g_flashAt = g_time;
+    g_thunderAt = g_time + 0.4 + dist * 0.02;
+}
+static void HideBolt() {
+    for (int i = 0; i < 7; i++) Show(g_bolt[i], false);
+}
+static void StormTick(Vector3 hp) {
+    EnsureStorm();
+    if (g_nextBolt == 0) g_nextBolt = g_time + 2.0 + Rand01() * 3.0;
+    if (g_time >= g_nextBolt && Alive(g_bolt[0].get())) {
+        StrikeBolt(hp);
+        g_nextBolt = g_time + 5.0 + Rand01() * 7.0;               // one strike every 5-12 seconds
+    }
+    if (g_boltHideAt > 0 && g_time >= g_boltHideAt) { HideBolt(); g_boltHideAt = 0; }
+    Il2CppObject *l = g_wxLight.get();
+    if (Alive(l) && g_lightIntensity.IsValid()) {              // a dim flash that fades, with a small flicker
+        float t = (float)(g_time - g_flashAt);
+        float k = g_flashAt > 0 && t < 0.4f ? 1.0f - t / 0.4f : 0.0f;
+        if (t > 0.12f && t < 0.2f) k *= 0.3f;
+        G.behaviourSetEnabled[l](k > 0);
+        if (k > 0) {
+            G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(0, 5.0f, 0));
+            g_lightIntensity[l](9.0f * k);
+        }
+    }
+    if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
+}
+
+static void WeatherOff() {
+    g_wxOn = false;
+    g_fxMode = -1;
+    g_nextBolt = 0;
+    g_thunderAt = 0;
+    g_boltHideAt = 0;
+    g_flashAt = 0;
+    Show(g_wxRoot, false);                                     // hides every piece; they are reused next time
+    if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
+    if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
+    HideBolt();
+}
+static void WeatherReset() {                                   // room change: the old objects are gone
+    Kill(g_wxRoot);
+    Kill(g_wxAudioGo);
+    Kill(g_wxClip);
+    for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
+    for (int i = 0; i < 7; i++) g_bolt[i].clear();
+    g_wxLight.clear();
+    g_wxAudioSrc.clear();
+    g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
+    g_nextBolt = g_thunderAt = g_boltHideAt = g_flashAt = 0;
+    g_wxOn = false;
+}
+
+static void WeatherTick(float dt) {
+    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
+    Il2CppObject *head = g_head.get();
+    if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
+    if (!EnsureWxRoot()) return;
+    if (!g_wxOn) { g_wxOn = true; Show(g_wxRoot, true); }
+    Vector3 hp = G.trGetPosition[head]();
+    if (g_time >= g_nextGround) {                              // ground height, four times a second
+        g_nextGround = g_time + 0.25;
+        int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : -5;
+        BNM::Structures::Unity::RaycastHit hit{};
+        bool found = G.raycast.IsValid() && G.raycast(hp, Vector3(0, -1, 0), &hit, 8.0f, mask ? mask : -5);
+        g_groundY = found ? hit.point.y : hp.y - 2.5f;
+    }
+    int want = kFxCounts[mode][g_wxIntensity];
+    for (int n = 0; n < 25 && g_fxMade < kMaxFx; n++) {        // make the pool a few pieces per frame
+        Il2CppObject *o = Prim(3, Color(1, 1, 1, 1), false);
+        if (!o) break;
+        int i = g_fxMade++;
+        Il2CppObject *t = Tr(o);
+        G.trSetParent[t](Tr(g_wxRoot.get()), false);
+        g_fx[i].set(o);
+        g_fxT[i].set(t);
+        StyleFx(i, mode);
+        RespawnFx(i, hp, true);
+        G.goSetActive[o](i < want);
+    }
+    if (g_fxMade == 0) return;
+    if (mode != g_fxMode) {                                    // switched effect: restyle and refill the air
+        g_fxMode = mode;
+        for (int i = 0; i < g_fxMade; i++) { StyleFx(i, mode); RespawnFx(i, hp, true); }
+        g_fxShown = -1;
+    }
+    if (want != g_fxShown) {
+        for (int i = 0; i < g_fxMade; i++) if (Alive(g_fx[i].get())) G.goSetActive[g_fx[i].get()](i < want);
+        g_fxShown = want;
+    }
+    int active = std::min(want, g_fxMade);
+    float t = (float)g_time;
+    for (int i = 0; i < active; i++) {
+        Vector3 &p = g_fxPos[i];
+        if (mode == 0) {                                       // snow: slow, swaying
+            p.y -= 1.1f * dt;
+            p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
+            p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
+        } else {                                               // rain: fast, a little wind
+            p.y -= 9.0f * dt;
+            p.x += 0.6f * dt;
+        }
+        float dx = p.x - hp.x, dz = p.z - hp.z;
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
+        if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
+    }
+    if (mode == 2) StormTick(hp);
+    else { HideBolt(); g_nextBolt = 0; }
+}
+
+// ---- Overpowered (all of it changes only your own body; nothing is sent) ---------------
+// Very Long Arms moves your own hands, like the dances do, so the room sees the long arms
+// the way it sees any pose: the game sends your hands as usual and nothing extra goes out.
+static const float kArmScales[] = {1.5f, 2.0f, 3.0f, 4.0f};
+static int g_armScale = 1;
+static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %.1fx", kArmScales[g_armScale]); }
+
+// To stretch an arm the controller trackers have to be paused (they would put the hand back),
+// so the real controller position is read from the headset's input instead. That position is
+// in the space of one of the hand's parents; the first frames check which one by comparing
+// with where the hand really is. If nothing matches, Very Long Arms switches itself off.
+static int g_laState = 0;                      // 0 starting, 1 checking, 2 working, 3 not supported
+static int g_laChecks = 0, g_laSpaceL = -1, g_laSpaceR = -1;
+static bool g_laOwns = false, g_laInit = false;
+static double g_laNextPause = 0;
+// Where the controller position comes from. This game build hides the XR feature-value reader, so
+// try the older XR calls and the Oculus ones; whichever exists is used (and logged once).
+static int g_laProv = 0;                       // 0 none, 1 XR InputTracking, 2 OVRInput
+static Method<Vector3> g_provPos;
+static Method<Quaternion> g_provRot;
+static void LongArmsToggled() { g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; }
+
+static bool LaInit() {
+    if (g_laInit) return g_laProv != 0;
+    g_laInit = true;
+    Class it("UnityEngine.XR", "InputTracking");
+    if (it.IsValid()) {
+        g_provPos = it.GetMethod("GetLocalPosition", 1);
+        g_provRot = it.GetMethod("GetLocalRotation", 1);
+        if (g_provPos.IsValid() && g_provRot.IsValid()) g_laProv = 1;
+    }
+    if (!g_laProv) {
+        Class ov("", "OVRInput");
+        if (ov.IsValid()) {
+            g_provPos = ov.GetMethod("GetLocalControllerPosition", 1);
+            g_provRot = ov.GetMethod("GetLocalControllerRotation", 1);
+            if (g_provPos.IsValid() && g_provRot.IsValid()) g_laProv = 2;
+        }
+    }
+    ym::log("clientdabell: long arms controller source: %s", g_laProv == 1 ? "XR InputTracking" : g_laProv == 2 ? "OVRInput" : "none");
+    return g_laProv != 0;
+}
+// The controller's real position and rotation in the world, as one of the hand's parents sees it.
+static bool ReadController(int node, Il2CppObject *hand, int &space, Vector3 &pos, Quaternion &rot) {
+    int arg = g_laProv == 1 ? node : (node == 4 ? 1 : 2);        // XRNode 4/5, or OVRInput.Controller LTouch/RTouch
+    Vector3 lp = g_provPos(arg);
+    Quaternion lr = g_provRot(arg);
+    Il2CppObject *a = G.trGetParent[hand]();
+    Vector3 handPos = G.trGetPosition[hand]();
+    int best = -1;
+    float bestErr = 0.10f;
+    for (int k = 0; k < 3 && a; k++, a = G.trGetParent[a]()) {
+        if (space >= 0 && k != space) continue;
+        Vector3 w = G.trTransformPoint[a](lp), e = w - handPos;
+        float err = sqrtf(Dot(e, e));
+        if (space >= 0 || err < bestErr) { best = k; bestErr = err; pos = w; rot = G.trGetRotation[a]() * lr; }
+        if (space >= 0) break;
+    }
+    if (best < 0) return false;
+    if (space < 0) space = best;
+    return true;
+}
+// Stretch mode needs the trackers to place the hands during Update (before this mod runs), not just
+// before rendering, or they would move the hands back after every stretch. Done once per room.
+static bool g_laTrackersSet = false;
+static void SetTrackersToUpdate() {
+    if (g_laTrackersSet || !G.trGetParent.IsValid()) return;
+    g_laTrackersSet = true;
+    int found = 0, changed = 0;
+    for (auto nc : std::vector<std::tuple<const char *, const char *, const char *>>{
+             {"UnityEngine.XR.Interaction.Toolkit", "XRBaseController", "set_updateTrackingType"},
+             {"UnityEngine.InputSystem.XR", "TrackedPoseDriver", "set_updateType"},
+             {"UnityEngine.SpatialTracking", "TrackedPoseDriver", "set_updateType"}}) {
+        Class c(std::get<0>(nc), std::get<1>(nc));
+        if (!c.IsValid()) continue;
+        Method<void> setter = c.GetMethod(std::get<2>(nc), 1);
+        for (Il2CppObject *t : {g_leftHand.get(), g_rightHand.get()})
+            for (int up = 0; up < 3 && t; up++, t = G.trGetParent[t]()) {
+                Il2CppObject *go = G.compGameObject[t]();
+                Il2CppObject *comp = go ? G.goGetComponent[go]((Il2CppObject *)c.GetMonoType()) : nullptr;
+                if (!comp) continue;
+                found++;
+                if (setter.IsValid()) { setter[comp](0); changed++; }
+            }
+    }
+    ym::log("clientdabell: long arms stretch: %d trackers found, %d set to Update", found, changed);
+}
+static bool g_laStretch = false;               // fallback: stretch the hand from where the trackers just put it
+static void LongArmsFail(const char *why) {
+    g_laState = 3;
+    if (g_laOwns && !g_dancing) PauseTrackers(false);
+    g_laOwns = false;
+    f_longArms = false;
+    g_dirty = true;
+    ym::log("clientdabell: long arms off: %s", why);
+    Notify("Long Arms isn't supported here");
+}
+static void LongArmsTick() {
+    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    bool want = f_longArms && !g_menuShown && !g_dancing && head && lh && rh;
+    if (!want) {
+        if (g_laOwns && !g_dancing) { PauseTrackers(false); g_laOwns = false; }   // the menu and the dances need normal hands
+        if (!f_longArms) g_laState = 0;
+        return;
+    }
+    Vector3 pl, pr;
+    Quaternion ql, qr;
+    if (!g_laStretch && (!LaInit() || !G.trTransformPoint.IsValid() || !G.trGetParent.IsValid() || !G.trGetRotation.IsValid())) {
+        g_laStretch = true;
+        ym::log("clientdabell: long arms: controller input not available, using stretch mode");
+    }
+    if (g_laStretch) {                                             // the trackers place the hands each frame; push them outward from the chest
+        SetTrackersToUpdate();
+        Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+        float k = kArmScales[g_armScale];
+        static int logged = 0;
+        for (Il2CppObject *h : {lh, rh}) {
+            Vector3 before = G.trGetPosition[h]();
+            G.trSetPosition[h](chest + (before - chest) * k);
+            if (logged < 4) { Vector3 after = G.trGetPosition[h](); ym::log("clientdabell: stretch hand %.2f,%.2f,%.2f -> %.2f,%.2f,%.2f", before.x, before.y, before.z, after.x, after.y, after.z); logged++; }
+        }
+        return;
+    }
+    if (g_laState < 2) {                                           // trackers still on: find out how to read the controllers
+        bool okL = ReadController(4, lh, g_laSpaceL, pl, ql), okR = ReadController(5, rh, g_laSpaceR, pr, qr);
+        if (okL && okR) { g_laState = 2; ym::log("clientdabell: long arms ready (spaces %d/%d)", g_laSpaceL, g_laSpaceR); }
+        else if (++g_laChecks > 60) { g_laStretch = true; ym::log("clientdabell: long arms: controller positions don't match the hands, using stretch mode"); }
+        return;
+    }
+    if (g_pausedN == 0 && g_time >= g_laNextPause) {               // pause the trackers (retry twice a second)
+        g_laNextPause = g_time + 0.5;
+        PauseTrackers(true);
+        g_laOwns = g_pausedN > 0;
+        if (!g_laOwns) ym::log("clientdabell: long arms: couldn't pause the hand trackers");
+    }
+    if (!ReadController(4, lh, g_laSpaceL, pl, ql) || !ReadController(5, rh, g_laSpaceR, pr, qr)) return;
+    Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+    float k = kArmScales[g_armScale];
+    G.trSetPosition[lh](chest + (pl - chest) * k);
+    G.trSetRotation[lh](ql);
+    G.trSetPosition[rh](chest + (pr - chest) * k);
+    G.trSetRotation[rh](qr);
+}
+
+// Mega Jump: press B (Y if the menu is on your right hand) for a jump of any power, in the air too.
+static const float kJumpPowers[] = {6.0f, 10.0f, 16.0f, 24.0f};
+static const char *kJumpNames[] = {"small", "medium", "big", "huge"};
+static int g_jumpPower = 1;
+static bool g_megaPrev = false;
+static double g_nextMega = 0;
+static void NextJumpPower() { g_jumpPower = (g_jumpPower + 1) % 4; Notify("Jump power: %s", kJumpNames[g_jumpPower]); }
+static void MegaJumpTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.y : in.b, press = btn && !g_megaPrev;
+    g_megaPrev = btn;
+    Vector3 v;
+    if (!f_megaJump || !press || g_menuShown || g_time < g_nextMega || !GetVel(v)) return;
+    g_nextMega = g_time + 0.25;
+    SetVel(Vector3(v.x, kJumpPowers[g_jumpPower], v.z));
+}
+
+// Super Fly: like Velocity Fly, but along your head, and a lot faster.
+static void SuperFlyTick(const Buttons &in) {
+    Il2CppObject *head = g_head.get(), *player = g_player.get();
+    if (!f_superFly || !in.a || !head || !player) return;
+    SetVel(G.trGetForward[head]() * 35.0f);
+    if (G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
+}
+
+// Rocket Boots: hold both triggers and you climb, keeping your sideways speed.
+static void RocketTick(const Buttons &in, float dt) {
+    Vector3 v;
+    if (!f_rocket || !in.ltrig || !in.rtrig || !GetVel(v)) return;
+    v.y += 30.0f * dt;
+    if (v.y > 14.0f) v.y = 14.0f;
+    SetVel(v);
+    if (G.plNoGravityFor.IsValid() && g_player.get()) G.plNoGravityFor[g_player.get()](0.1f);
+}
+
+// Ground Pound (mace style): press both grips to slam straight down. The harder the fall, the
+// bigger the smash: on landing a shockwave ring spreads out from your feet and you bounce back up.
+// All of it is only on your own screen and your own body.
+static bool g_poundPrev = false, g_pounding = false;
+static double g_poundStart = 0, g_ringStart = -1;
+static float g_poundTopY = 0, g_ringPower = 1;
+static Vector3 g_ringAt;
+static Ref g_ring[2];
+static void RingTick() {
+    if (g_ringStart < 0) return;
+    float t = (float)(g_time - g_ringStart) / 0.55f;
+    if (t >= 1) { g_ringStart = -1; for (auto &r : g_ring) Show(r, false); return; }
+    for (int i = 0; i < 2; i++) {
+        Il2CppObject *o = g_ring[i].get();
+        if (!Alive(o)) continue;
+        float tt = t - i * 0.12f;
+        bool vis = tt > 0;
+        Show(g_ring[i], vis);
+        if (!vis) continue;
+        float e = 1 - (1 - tt) * (1 - tt);
+        float r = (1.0f + 6.0f * g_ringPower * e) * 2;             // diameter
+        float th = 0.06f * (1 - tt) + 0.005f;
+        Il2CppObject *tr = Tr(o);
+        G.trSetPosition[tr](g_ringAt + Vector3(0, 0.03f + i * 0.03f, 0));
+        G.trSetLocalScale[tr](Vector3(r, th, r));
+        SetColor(o, i ? Color(1.0f, 0.85f, 0.4f, 1) : Color(1.0f, 1.0f, 1.0f, 1));
+    }
+}
+static void GroundPoundTick(const Buttons &in) {
+    bool both = in.lgrip && in.rgrip, press = both && !g_poundPrev;
+    g_poundPrev = both;
+    RingTick();
+    Vector3 v, body;
+    if (!f_groundPound || !GetVel(v) || !BodyPos(body)) return;
+    if (press) {
+        g_pounding = true;
+        g_poundStart = g_time;
+        g_poundTopY = body.y;
+        SetVel(Vector3(0, -35.0f, 0));
+        return;
+    }
+    if (!g_pounding) return;
+    if (g_time - g_poundStart > 4.0) { g_pounding = false; return; }
+    if (g_time - g_poundStart < 0.12 || v.y > -6.0f) {
+        if (g_time - g_poundStart >= 0.12 && v.y > -6.0f) {        // landed
+            g_pounding = false;
+            float fall = g_poundTopY - body.y;
+            g_ringPower = fall < 1 ? 0.5f : fall > 12 ? 2.0f : 0.5f + 1.5f * (fall - 1) / 11;
+            g_ringAt = body;
+            BNM::Structures::Unity::RaycastHit hit{};
+            if (G.raycast.IsValid() && G.raycast(body, Vector3(0, -1, 0), &hit, 3.0f, -5)) g_ringAt = hit.point;
+            for (auto &r : g_ring)
+                if (!Alive(r.get())) {
+                    Il2CppObject *o = Prim(2, Color(1, 1, 1, 1), false);   // flat cylinder = a ring on the ground
+                    if (o) r.set(o);
+                }
+            g_ringStart = g_time;
+            SetVel(Vector3(v.x, 5.0f + 5.0f * g_ringPower, v.z));      // the bounce
+            Buzz();
+            Notify("SMASH!");
+        }
+    }
+}
+
+// Bounce: every hard landing sends you back up, a little lower each time (like a rubber ball).
+static float g_bounceVy = 0;
+static double g_bounceNext = 0;
+static void BounceTick() {
+    Vector3 v;
+    if (!f_bounce || !GetVel(v)) { g_bounceVy = 0; return; }
+    if (g_bounceVy < -4.0f && v.y > g_bounceVy * 0.3f && g_time >= g_bounceNext) {   // suddenly stopped falling
+        float up = -g_bounceVy * 0.85f;
+        up = up < 7.0f ? 7.0f : up > 30.0f ? 30.0f : up;
+        SetVel(Vector3(v.x, up, v.z));
+        g_bounceNext = g_time + 0.25;
+        v.y = up;
+    }
+    g_bounceVy = v.y;
+}
+
+// Fling Gun: press A (X if the menu is on your right hand) to launch yourself the way your free hand points.
+static bool g_flingPrev = false;
+static double g_flingNext = 0;
+static void FlingGunTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.x : in.a, press = btn && !g_flingPrev;
+    g_flingPrev = btn;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    Vector3 v;
+    if (!f_flingGun || !press || g_menuShown || g_dance >= 0 || !hand || g_time < g_flingNext || !GetVel(v)) return;
+    g_flingNext = g_time + 0.4;
+    SetVel(G.trGetForward[hand]() * 32.0f);
+    Buzz();
+}
+
+// Launch Items Gun: squeeze the grip of your free hand to shoot colorful blocks and balls that fly,
+// bounce and fade. They are local props that only you see; real room items are never touched.
+static constexpr int kMaxShots = 24;
+struct Shot { Ref go; Vector3 pos, vel; double born = -1; };
+static Shot g_shots[kMaxShots];
+static int g_shotNext = 0;
+static bool g_shotPrev = false;
+static double g_shotCool = 0;
+static void ItemGunTick(const Buttons &in, float dt) {
+    bool grip = f_rightHand ? in.lgrip : in.rgrip, other = f_rightHand ? in.rgrip : in.lgrip;
+    bool press = grip && !other && !g_shotPrev;
+    g_shotPrev = grip;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    if (f_propGun && press && !g_menuShown && g_dance < 0 && hand && g_time >= g_shotCool && G.createPrimitive.IsValid()) {
+        g_shotCool = g_time + 0.2;
+        Shot &s = g_shots[g_shotNext];
+        g_shotNext = (g_shotNext + 1) % kMaxShots;
+        Kill(s.go);                                                // recycle the oldest
+        float h = fmodf((float)g_time * 0.37f, 1.0f);
+        Il2CppObject *o = Prim(g_shotNext % 2 ? 0 : 3, Rainbow(h), false);
+        if (o) {
+            G.trSetLocalScale[Tr(o)](Vector3(0.25f, 0.25f, 0.25f));
+            s.go.set(o);
+            Vector3 d = G.trGetForward[hand]();
+            s.pos = G.trGetPosition[hand]() + d * 0.3f;
+            s.vel = d * 22.0f;
+            s.born = g_time;
+            G.trSetPosition[Tr(o)](s.pos);
+            Buzz();
+        }
+    }
+    for (auto &s : g_shots) {
+        Il2CppObject *o = s.go.get();
+        if (!o) continue;
+        if (!Alive(o) || g_time - s.born > 6.0 || !f_propGun) { Kill(s.go); continue; }
+        Vector3 from = s.pos;
+        s.vel.y -= 9.8f * dt;
+        s.pos = s.pos + s.vel * dt;
+        Vector3 seg = s.pos - from;
+        float len = sqrtf(Dot(seg, seg));
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (len > 1e-4f && G.raycast.IsValid() && G.raycast(from, seg * (1.0f / len), &hit, len + 0.12f, -5)) {
+            float vn = Dot(s.vel, hit.normal);
+            s.vel = (s.vel - hit.normal * (2 * vn)) * 0.55f;       // bounce, losing energy
+            s.pos = hit.point + hit.normal * 0.14f;
+        }
+        G.trSetPosition[Tr(o)](s.pos);
+    }
+}
+
+// Grapple Hook: hold a trigger (either hand, or both) and a rope pulls you toward the spot that hand points at.
+struct Grapple { Ref go, line; bool on = false, prev = false; Vector3 point; };
+static Grapple g_grap[2];
+static void GrappleHand(Grapple &g, Il2CppObject *hand, bool trig, float dt, Vector3 &pull) {
+    bool held = f_grapple && trig && g_dance < 0 && !g_menuShown && hand && G.raycast.IsValid() && G.lrSetPosition.IsValid();
+    bool press = held && !g.prev;
+    g.prev = trig;
+    if (!held) {
+        if (g.on) { g.on = false; Show(g.go, false); }
+        return;
+    }
+    Vector3 start = G.trGetPosition[hand](), dir = G.trGetForward[hand]();
+    if (press) {
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (!G.raycast(start + dir * 0.25f, dir, &hit, 80.0f, -5)) return;
+        g.point = hit.point;
+        g.on = true;
+        if (!g.line.get()) {                                       // each rope is made once
+            Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGrapple"));
+            Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
+            if (!line) { g.on = false; return; }
+            if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
+                if (G.shader.get()) G.matSetShader[m](G.shader.get());
+                G.matSetColor[m](Color(1.0f, 1.0f, 1.0f, 1));
+            }
+            G.lrSetStartWidth[line](0.02f);
+            G.lrSetEndWidth[line](0.02f);
+            G.lrSetPositionCount[line](2);
+            G.lrSetUseWorldSpace[line](true);
+            g.go.set(lineGo);
+            g.line.set(line);
+        }
+        Show(g.go, true);
+    }
+    Vector3 body;
+    if (!g.on || !BodyPos(body) || !Alive(g.line.get())) return;
+    Vector3 to = g.point - body;
+    float dist = sqrtf(Dot(to, to));
+    if (dist < 1.5f) { g.on = false; Show(g.go, false); return; }  // arrived
+    pull = pull + to * (45.0f * dt / dist);
+    G.lrSetPosition[g.line.get()](0, start);
+    G.lrSetPosition[g.line.get()](1, g.point);
+}
+static void GrappleTick(const Buttons &in, float dt) {
+    Vector3 v, pull(0, 0, 0);
+    GrappleHand(g_grap[0], g_leftHand.get(), in.ltrig, dt, pull);
+    GrappleHand(g_grap[1], g_rightHand.get(), in.rtrig, dt, pull);
+    if (!g_grap[0].on && !g_grap[1].on) return;
+    if (!GetVel(v)) return;
+    v = v + pull;                                                  // both ropes pull together
+    float speed = sqrtf(Dot(v, v));
+    if (speed > 28.0f) v = v * (28.0f / speed);
+    SetVel(v);
+}
+
+// Big Hands: both hands are scaled up and put back afterwards.
+static Method<Vector3> g_trGetScale;
+static bool g_bigApplied = false;
+static Vector3 g_handScaleL, g_handScaleR;
+static void ApplyBigHands() {
+    Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    if (!lh || !rh) return;
+    if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
+    if (!g_trGetScale.IsValid()) return;
+    if (f_bigHands && !g_bigApplied) {
+        g_handScaleL = g_trGetScale[lh]();
+        g_handScaleR = g_trGetScale[rh]();
+        G.trSetLocalScale[lh](g_handScaleL * 2.5f);
+        G.trSetLocalScale[rh](g_handScaleR * 2.5f);
+        g_bigApplied = true;
+    } else if (!f_bigHands && g_bigApplied) {
+        G.trSetLocalScale[lh](g_handScaleL);
+        G.trSetLocalScale[rh](g_handScaleR);
+        g_bigApplied = false;
+    }
+}
+
+static void OverpoweredOff() {
+    for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) { *it.flag = false; if (it.fn) it.fn(); }
+    Notify("Overpowered off");
+}
+static void OverpoweredTick(const Buttons &in, float dt) {
+    MegaJumpTick(in);
+    SuperFlyTick(in);
+    RocketTick(in, dt);
+    GrappleTick(in, dt);
+    GroundPoundTick(in);
+    FlingGunTick(in);
+    BounceTick();
+    ItemGunTick(in, dt);
+    if (f_bigHands != g_bigApplied) ApplyBigHands();           // also puts them back after Turn Everything Off
+    LongArmsTick();
+}
+static void OverpoweredReset() {                               // room change: the old objects are gone
+    g_laTrackersSet = false;
+    for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
+    g_bigApplied = false;
+    g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
+    g_megaPrev = g_poundPrev = g_pounding = g_flingPrev = g_shotPrev = false;
+    for (auto &sh : g_shots) { Kill(sh.go); sh.born = -1; }
+    g_ringStart = -1;
+    for (auto &r : g_ring) Kill(r);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
+    g_audioSrc.clear();
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
+    WeatherReset();
+    OverpoweredReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
         NoclipTick(none);
@@ -1452,13 +2611,22 @@ static void OnUpdate(float dt) {
     NoclipTick(in);
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
-    catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
+    catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
+    try { LoadTick(); }
+    catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
+    try { WeatherTick(dt); }
+    catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
+    try { OverpoweredTick(in, dt); }
+    catch (...) {
+        for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) *it.flag = false;
+        ym::log("clientdabell: overpowered error, turned off");
+    }
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
 YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
     if (!ym::init(api)) return -1;
     ym::onUpdate(OnUpdate);
-    ym::log("Blaze Menu loaded on %s (%s)", api->gameVersion, api->buildId);
+    ym::log("ClientDaBell %s loaded on %s (%s)", CDB_VERSION, api->gameVersion, api->buildId);
     return 0;
 }
