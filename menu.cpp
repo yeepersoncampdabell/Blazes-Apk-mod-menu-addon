@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.3"
+#define CDB_VERSION "v1.2.4 Dev 2"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -92,6 +92,16 @@ static struct {
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     BNM::MonoType *tAudioSource = nullptr;
+    // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
+    BNM::MonoType *tRecorder = nullptr;
+    Method<void> recSetSource, recSetClip, recSetLoop, recSetTransmit, recSetVad, recRestart0, recRestart1,
+                 recSetRecording, recSetOnlyWhenEnabled, recStart;
+    Method<int> recGetSource;
+    Method<bool> recGetTransmit, recGetVad, recGetRecording;
+    Field<int> recFieldSource;                         // the backing fields, set too (some versions read these)
+    Field<Il2CppObject *> recFieldClip;
+    Field<bool> recFieldLoop;
+    Method<Il2CppObject *> goFind;
     BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
     BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
     BNM::IL2CPP::Il2CppClass *objectClass = nullptr, *stringClass = nullptr;
@@ -101,6 +111,15 @@ static struct {
     Method<void> itemDrop, setHeldItem;
     void *(*arrayNew)(void *, uintptr_t) = nullptr;
     void *(*valueBox)(void *, void *) = nullptr;
+    // Room effects: your weather is kept on your Photon player (a custom property), which
+    // every client in the room already receives. ClientDaBell reads it; the game ignores it.
+    BNM::IL2CPP::Il2CppClass *intClass = nullptr;
+    Method<Il2CppObject *> pnLocalPlayer, pnOthers, plGetProps, htGet;
+    Method<BNM::Structures::Mono::String *> plGetNick;
+    Method<void> htSet;
+    MethodBase plSetProps;
+    int plSetPropsArgs = 0;
+    Class htClass;
     Method<bool> behaviourGetEnabled;
     Method<void> behaviourSetEnabled;
     std::vector<BNM::MonoType *> trackerTypes;
@@ -116,7 +135,8 @@ static struct {
     Method<void> goSetLayer;
     BNM::MonoType *tRigidbody = nullptr, *tCollider = nullptr, *tCanvas = nullptr, *tText = nullptr,
                   *tFont = nullptr, *tRenderer = nullptr, *tMeshCollider = nullptr, *tLine = nullptr;
-    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
+    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger, usageStick, usageStickClick;
+    Method<bool> tryGetVec2;            // thumbsticks
 } G;
 
 static bool Lookups() {
@@ -157,7 +177,35 @@ static bool Lookups() {
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
         }
+        Class rec("Photon.Voice.Unity", "Recorder");
+        if (rec.IsValid()) {
+            G.tRecorder = rec.GetMonoType();
+            G.recSetSource = rec.GetMethod("set_SourceType", 1);       // 0 = Microphone, 1 = AudioClip
+            G.recGetSource = rec.GetMethod("get_SourceType", 0);
+            G.recSetClip = rec.GetMethod("set_AudioClip", 1);
+            G.recSetLoop = rec.GetMethod("set_LoopAudioClip", 1);
+            G.recSetTransmit = rec.GetMethod("set_TransmitEnabled", 1);
+            G.recGetTransmit = rec.GetMethod("get_TransmitEnabled", 0);
+            G.recSetVad = rec.GetMethod("set_VoiceDetection", 1);       // off while a song plays, or quiet parts get cut
+            G.recGetVad = rec.GetMethod("get_VoiceDetection", 0);
+            G.recSetRecording = rec.GetMethod("set_IsRecording", 1);
+            G.recGetRecording = rec.GetMethod("get_IsRecording", 0);
+            G.recSetOnlyWhenEnabled = rec.GetMethod("set_RecordOnlyWhenEnabled", 1);
+            G.recStart = rec.GetMethod("StartRecording", 0);
+            G.recFieldSource = rec.GetField("sourceType");
+            G.recFieldClip = rec.GetField("audioClip");
+            G.recFieldLoop = rec.GetField("loopAudioClip");
+            for (auto &m : rec.GetMethods(false)) {                     // RestartRecording() or RestartRecording(bool)
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "RestartRecording") != 0) continue;
+                if (mi->parameters_count == 0) G.recRestart0 = m;
+                else if (mi->parameters_count == 1) G.recRestart1 = m;
+            }
+        }
+        ym::log("clientdabell: voice recorder=%d source=%d clip=%d restart=%d/%d", G.tRecorder != nullptr, G.recSetSource.IsValid(),
+                G.recSetClip.IsValid(), G.recRestart0.IsValid(), G.recRestart1.IsValid());
     }
+    G.goFind = go.GetMethod("Find", 1);
     G.trSetParent = Overload(tr, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
     G.trSetPosition = tr.GetMethod("set_position", 1);
     G.trSetRotation = tr.GetMethod("set_rotation", 1);
@@ -191,6 +239,9 @@ static bool Lookups() {
     G.rtSetSizeDelta = rt.GetMethod("set_sizeDelta", 1);
     G.deviceAtNode = dev.GetMethod("GetDeviceAtXRNode", 1);
     G.tryGetBool = dev.GetMethod("TryGetFeatureValue_bool", 3);
+    for (const char *n : {"TryGetFeatureValue_Vector2f", "TryGetFeatureValue_Vector2"})
+        if (!G.tryGetVec2.IsValid()) G.tryGetVec2 = dev.GetMethod(n, 3);
+    ym::log("clientdabell: thumbsticks %d", G.tryGetVec2.IsValid());
     G.haptic = dev.GetMethod("SendHapticImpulse", 4);    // optional: a small buzz on press
     G.leftHand = player.GetField("leftHandTransform");
     G.rightHand = player.GetField("rightHandTransform");
@@ -259,6 +310,38 @@ static bool Lookups() {
         ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
                 G.itemKey.IsValid(), G.arrayNew && G.valueBox);
     }
+    {   // room effects (see RoomWxTick)
+        G.intClass = Class("System", "Int32").GetClass();
+        Class pn("Photon.Pun", "PhotonNetwork"), pl("Photon.Realtime", "Player"), ht("ExitGames.Client.Photon", "Hashtable");
+        if (pn.IsValid()) {
+            G.pnLocalPlayer = pn.GetMethod("get_LocalPlayer", 0);
+            G.pnOthers = pn.GetMethod("get_PlayerListOthers", 0);
+        }
+        if (pl.IsValid()) {
+            G.plGetProps = pl.GetMethod("get_CustomProperties", 0);
+            G.plGetNick = pl.GetMethod("get_NickName", 0);
+            for (auto &m : pl.GetMethods(false)) {                    // SetCustomProperties(Hashtable[, expected, webFlags])
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "SetCustomProperties") != 0) continue;
+                if (mi->parameters_count == 1 || mi->parameters_count == 3) { G.plSetProps = m; G.plSetPropsArgs = mi->parameters_count; }
+            }
+        }
+        if (ht.IsValid()) {
+            G.htClass = ht;
+            // Photon's Hashtable has this[object] (and in some versions this[byte]); look up
+            // through the parent classes too, in case it only inherits the indexer.
+            for (Class c = ht; c.IsValid() && c.GetClass(); ) {
+                if (!G.htSet.IsValid()) G.htSet = Overload(c, "set_Item", {"System.Object", "System.Object"});
+                if (!G.htGet.IsValid()) G.htGet = Overload(c, "get_Item", {"System.Object"});
+                auto *parent = c.GetClass()->parent;
+                if (!parent || (G.htSet.IsValid() && G.htGet.IsValid())) break;
+                c = Class(&parent->byval_arg);
+            }
+        }
+        ym::log("clientdabell: room effects local=%d others=%d props=%d/%d(%d) table=%d/%d", G.pnLocalPlayer.IsValid(),
+                G.pnOthers.IsValid(), G.plGetProps.IsValid(), G.plSetProps.IsValid(), G.plSetPropsArgs,
+                G.htSet.IsValid(), G.htGet.IsValid());
+    }
     Class behaviour("UnityEngine", "Behaviour");
     G.behaviourGetEnabled = behaviour.GetMethod("get_enabled", 0);
     G.behaviourSetEnabled = behaviour.GetMethod("set_enabled", 1);
@@ -280,6 +363,8 @@ static bool Lookups() {
     G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
     G.usageGrip.set((Il2CppObject *)CreateMonoString("GripButton"));
     G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
+    G.usageStick.set((Il2CppObject *)CreateMonoString("Primary2DAxis"));
+    G.usageStickClick.set((Il2CppObject *)CreateMonoString("Primary2DAxisClick"));
     for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
         if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
     // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
@@ -294,15 +379,10 @@ static bool Lookups() {
                 Il2CppObject *fo = fc.IsValid() ? fc.CreateNewObjectParameters(CreateMonoString(fpath.c_str())) : nullptr;
                 bool good = fo && G.alive((Il2CppObject *)fo);
                 ym::log("clientdabell: font ctor(path): object=%d alive=%d", fo ? 1 : 0, good ? 1 : 0);
-                if (!good && fc.IsValid()) {                       // second route: empty Font, then load the file into it
-                    Il2CppObject *f2 = fc.CreateNewObjectParameters();
-                    Method<void> load = fc.GetMethod("Internal_CreateFontFromPath", 2);
-                    if (f2 && load.IsValid()) {
-                        load(f2, (BNM::Structures::Mono::String *)CreateMonoString(fpath.c_str()));
-                        fo = f2;
-                        good = G.alive((Il2CppObject *)fo);
-                    }
-                    ym::log("clientdabell: font second route: object=%d loader=%d alive=%d", f2 ? 1 : 0, load.IsValid() ? 1 : 0, good ? 1 : 0);
+                if (!good && fc.IsValid()) {                       // second route: pick the constructor that takes one string
+                    Il2CppObject *f2 = fc.CreateNewObjectTypes({"System.String"}, CreateMonoString(fpath.c_str()));
+                    if (f2 && G.alive((Il2CppObject *)f2)) { fo = f2; good = true; }
+                    ym::log("clientdabell: font second route (string ctor): object=%d alive=%d", f2 ? 1 : 0, good ? 1 : 0);
                 }
                 MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
                 if (good && hasChar.IsValid()) {
@@ -359,11 +439,20 @@ static void SetText(Ref &text, const char *s) {
 
 // ---- input -------------------------------------------------------------------
 
-struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false; };
+struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false,
+                 lclick = false, rclick = false; Vector2 lstick = Vector2(0, 0), rstick = Vector2(0, 0); };
 static bool Pressed(int node, Ref &usage) {
     XRDevice d = G.deviceAtNode(node);
     bool v = false;
     if (d.initialized) G.tryGetBool(d.id, (BNM::Structures::Mono::String *)usage.get(), &v);
+    return v;
+}
+static Vector2 Stick(int node) {
+    Vector2 v(0, 0);
+    if (!G.tryGetVec2.IsValid()) return v;
+    XRDevice d = G.deviceAtNode(node);
+    if (d.initialized) G.tryGetVec2(d.id, (BNM::Structures::Mono::String *)G.usageStick.get(), &v);
+    if (v.x * v.x + v.y * v.y < 0.15f * 0.15f) v = Vector2(0, 0);   // dead zone
     return v;
 }
 static Buttons ReadButtons() {
@@ -373,6 +462,8 @@ static Buttons ReadButtons() {
     b.a = Pressed(right, G.usagePrimary); b.b = Pressed(right, G.usageSecondary);
     b.lgrip = Pressed(left, G.usageGrip); b.rgrip = Pressed(right, G.usageGrip);
     b.ltrig = Pressed(left, G.usageTrigger); b.rtrig = Pressed(right, G.usageTrigger);
+    b.lclick = Pressed(left, G.usageStickClick); b.rclick = Pressed(right, G.usageStickClick);
+    b.lstick = Stick(left); b.rstick = Stick(right);
     return b;
 }
 
@@ -380,7 +471,8 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -391,8 +483,11 @@ static int g_dupeArmed = 0;
 
 static constexpr int kDances = 18;                 // 0-7 Rig Mods dances, 8-17 Emotes
 static bool g_danceSel[kDances];
-static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
+static bool g_wxSel[4];             // Effects: Snow, Rain, Thunderstorm, Disco (pick one, like the dances)
 static int g_wx = -1;
+static bool g_todSel[4];            // Effects: Morning, Afternoon, Sunset, Night (pick one)
+static int g_tod = -1;
+static bool f_wxShare = true;      // Effects: send yours to the room and see theirs (ClientDaBell users)
 static int g_dance = -1;            // the picked dance, -1 = none
 static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
             f_notify = true;
@@ -423,15 +518,17 @@ static void PrevSong();
 static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
+static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
 static void NextArmLength();
 static void NextJumpPower();
 static void OverpoweredOff();
 static void NextWeatherIntensity();
+static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -452,6 +549,7 @@ static Item g_items[] = {
     {MAIN, "Overpowered", OPEN, OVERPOWERED},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
     {MAIN, "Emotes", OPEN, EMOTES},
+    {MAIN, "Credits", OPEN, CREDITS},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -468,6 +566,8 @@ static Item g_items[] = {
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
     {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
+    {MOVEMENT, "Thumbstick Fly", TOGGLE, MAIN, &f_stickFly},
+    {MOVEMENT, "Dash", TOGGLE, MAIN, &f_dash},
 
 
     {EMOTES, "Exit Emotes", OPEN, MAIN},
@@ -503,6 +603,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Next Song", ACTION, MAIN, nullptr, NextSong},
     {SOUNDBOARD, "Previous Song", ACTION, MAIN, nullptr, PrevSong},
     {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
+    {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
@@ -511,7 +612,13 @@ static Item g_items[] = {
     {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
     {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
     {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
+    {EFFECTS, "Disco", TOGGLE, MAIN, &g_wxSel[3], WeatherPicked},
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
+    {EFFECTS, "Morning", TOGGLE, MAIN, &g_todSel[0], TodPicked},
+    {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
+    {EFFECTS, "Sunset", TOGGLE, MAIN, &g_todSel[2], TodPicked},
+    {EFFECTS, "Night", TOGGLE, MAIN, &g_todSel[3], TodPicked},
+    {EFFECTS, "Room Effects", TOGGLE, MAIN, &f_wxShare},
 
     {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
     {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
@@ -538,6 +645,9 @@ static Item g_items[] = {
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
     {SETTINGS, "Turn Everything Off", ACTION, MAIN, nullptr, AllOff},
+
+    {CREDITS, "Exit Credits", OPEN, MAIN},
+    {CREDITS, "@CampDaBell", ACTION, MAIN, nullptr, nullptr},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
@@ -547,6 +657,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Settings", "Opens the settings."},
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
+    {"Credits", "Who made this menu."},
+    {"@CampDaBell", "The menu is made by @CampDaBell."},
     {"Platforms", "Hold a grip to stand on a platform."},
     {"Fly", "Hold A to fly where you look."},
     {"Fast Fly", "Makes Fly a lot faster."},
@@ -580,15 +692,22 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Jumping Jacks", "Arms go up and down at your sides. Hold left trigger."},
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
-    {"Soundboard", "Plays .wav songs from the sounds folder. Only you hear them."},
+    {"Soundboard", "Plays .wav songs from the sounds folder, through your voice chat."},
+    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it."},
     {"Next Song", "Picks the next song in the list."},
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
-    {"Sound Volume", "Quiet, medium or loud."},
+    {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Snow, rain and thunderstorms. Only you see and hear them."},
-    {"Snow", "Snow falls around you."},
+    {"Effects", "Weather, disco and time of day. Others with ClientDaBell see them too."},
+    {"Morning", "Low sun, soft warm light and a little mist."},
+    {"Afternoon", "High sun and a bright blue sky."},
+    {"Sunset", "An orange sky with the sun on the horizon."},
+    {"Night", "Dark sky, moon and stars."},
+    {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
+    {"Room Effects", "On: ClientDaBell users in the room see your effects and time of day, and you see theirs."},
+    {"Snow", "Snow falls in the room (for anyone with ClientDaBell)."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
@@ -607,6 +726,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Floss", "Hold left trigger to floss."},
     {"Dab", "Hold left trigger to dab."},
     {"Bounce", "Bounce back up every time you land."},
+    {"Thumbstick Fly", "Left stick flies where you look, right stick goes up and down."},
+    {"Dash", "Click the right thumbstick to dash where you look."},
     {"Fling Gun", "Press A (X) to fling yourself where you point."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
@@ -665,7 +786,7 @@ static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify) g_view.push_back(&it);
+        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -1109,10 +1230,11 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_wxShare) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
     g_wx = -1;
+    g_tod = -1;
     StopSound();
     g_itemQueue.clear();
     PointerToHand();
@@ -1127,9 +1249,35 @@ static void FlyTick(const Buttons &in, float dt) {
     StopMoving();
 }
 
+// Thumbstick Fly: you hover, and the sticks move you (left: forward/back and sideways where
+// you look, right: up/down). Moves your body like Fly does, so the room sees you fly.
+static void StickFlyTick(const Buttons &in, float dt) {
+    Il2CppObject *head = g_head.get(), *t = PlayerTransform();
+    if (!f_stickFly || !head || !t) return;
+    float speed = f_fastFly ? 20.0f : 8.0f;
+    Vector3 move = G.trGetForward[head]() * in.lstick.y + G.trGetRight[head]() * in.lstick.x + Vector3(0, in.rstick.y, 0);
+    G.trSetPosition[t](G.trGetPosition[t]() + move * (speed * dt));
+    StopMoving();
+    Il2CppObject *player = g_player.get();
+    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
+}
+
+// Dash: one quick burst where you look on each right-thumbstick click.
+static bool g_dashPrev = false;
+static double g_nextDash = 0;
+static void DashTick(const Buttons &in) {
+    bool press = in.rclick && !g_dashPrev;
+    g_dashPrev = in.rclick;
+    Il2CppObject *head = g_head.get(), *player = g_player.get();
+    if (!f_dash || !press || !head || g_time < g_nextDash) return;
+    g_nextDash = g_time + 0.5;
+    SetVel(G.trGetForward[head]() * 16.0f);
+    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.15f);
+}
+
 static void LowGravityTick(const Buttons &in, float dt) {
     Vector3 v;
-    if (!f_lowGravity || f_noGravity || (f_fly && in.a) || !GetVel(v)) return;
+    if (!f_lowGravity || f_noGravity || f_stickFly || (f_fly && in.a) || !GetVel(v)) return;
     SetVel(v + Vector3(0, 9.81f * 0.7f * dt, 0));       // cancels 70% of gravity
 }
 
@@ -1693,12 +1841,17 @@ static void SpawnOnHandTick(const Buttons &in) {
 // ---- soundboard: songs you copy onto the headset ----------------------------------------
 // Put .wav files in a folder named "sounds" next to the .so files in the mods folder
 // (Android/data/com.TrassGames.Yeeps/files/mods/sounds/). Open Soundboard, pick a song, press
-// Play. Only you hear it: it plays on an audio source on your head, nothing is sent.
+// Play. You hear it on an audio source on your head. With "Others Hear It" on, the song is
+// also sent through Photon Voice: the Recorder (your mic) is switched to the song, and put
+// back to your mic when the song ends, you press Stop, or you leave the room.
 // WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
-// the game never stalls, and mixed down to mono to save memory.
+// the game never stalls, and mixed down to mono to save memory. Every song is converted to
+// 48 kHz while it loads: Photon Voice only sends 8/12/16/24/48 kHz, so a 44.1 kHz song
+// (most of them) would sometimes not be heard by the room at all.
 static constexpr int kMaxSongs = 64;
-static constexpr uint64_t kMaxFrames = 12000000;       // about 4.5 minutes at 44.1 kHz
-static constexpr uint32_t kChunkFrames = 32768;        // frames read per game frame
+static constexpr double kMaxSeconds = 272;             // about 4.5 minutes
+static constexpr uint32_t kChunkFrames = 32768;        // 48 kHz frames made per game frame
+static constexpr uint32_t kVoiceRate = 48000;
 static std::vector<std::string> g_songs;
 static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
 static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
@@ -1709,10 +1862,14 @@ struct Loader {
     FILE *f = nullptr;
     int channels = 0, bits = 0, fmt = 0;               // fmt 1 = whole numbers, 3 = floating point
     uint32_t rate = 0, block = 0;
-    uint64_t frames = 0, done = 0;
+    uint64_t frames = 0, done = 0;                     // frames in the file, frames read so far
+    uint64_t outFrames = 0, outDone = 0;               // 48 kHz frames in the clip, written so far
+    double step = 1;                                   // file frames per 48 kHz frame
+    float prevA = 0, prevB = 0;                        // the last two file samples of the previous slice
     int song = -1, lastTen = -1;
     bool playWhenDone = false;
     std::vector<uint8_t> buf;
+    std::vector<float> mono;
 } g_load;
 
 static uint32_t U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -1825,6 +1982,158 @@ static bool EnsureAudioSource() {
     return true;
 }
 
+// ---- soundboard through voice chat (Photon Voice Recorder) ----------------------------
+// The Recorder is what sends your mic to the room. While a song plays it is switched to
+// "AudioClip" input with our song, so everyone near you hears it like your voice. Your
+// own settings (push to talk, voice detection) are saved first and put back after.
+static Ref g_recorder;
+static bool g_micOn = false, g_micPrevTransmit = true, g_micPrevVad = false;
+static double g_micUntil = 0, g_clipLen = 0;      // when the song ends; the song's length in seconds
+static double g_micCheckAt = 0;                  // when to check the room is getting it
+static int g_micTries = 0;
+
+static Il2CppObject *FindRecorder() {
+    Il2CppObject *r = g_recorder.get();
+    if (Alive(r)) return r;
+    g_recorder.clear();
+    r = nullptr;
+    if (!G.tRecorder) return nullptr;
+    if (G.goFind.IsValid()) {                       // the voice object most Photon VR games use
+        Il2CppObject *go = G.goFind(CreateMonoString("PhotonVRVoice"));
+        if (Alive(go)) r = G.goGetComponent[go]((Il2CppObject *)G.tRecorder);
+    }
+    if (!Alive(r) && (G.findScene.IsValid() || G.findSceneByType.IsValid())) {   // else any Recorder, an enabled one first
+        auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tRecorder)
+                                                      : G.findSceneByType((Il2CppObject *)G.tRecorder, 0));
+        uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        auto **el = arr ? (Il2CppObject **)(arr + 0x20) : nullptr;
+        for (uintptr_t i = 0; i < n && !Alive(r); i++)
+            if (Alive(el[i]) && (!G.behaviourGetEnabled.IsValid() || G.behaviourGetEnabled[el[i]]())) r = el[i];
+        for (uintptr_t i = 0; i < n && !Alive(r); i++) if (Alive(el[i])) r = el[i];
+        ym::log("clientdabell: %d voice recorders in the scene", (int)n);
+    }
+    if (!Alive(r)) return nullptr;
+    g_recorder.set(r);
+    return r;
+}
+
+static void RecSetInput(Il2CppObject *r, int type, Il2CppObject *clip, bool loop) {
+    // The clip first, so the Recorder never restarts on "AudioClip" with no clip
+    if (type == 1) {
+        if (G.recSetClip.IsValid()) G.recSetClip[r](clip);
+        else if (G.recFieldClip.IsValid()) G.recFieldClip[r] = clip;
+    }
+    if (G.recSetLoop.IsValid()) G.recSetLoop[r](loop);
+    if (G.recFieldLoop.IsValid()) G.recFieldLoop[r] = loop;
+    if (G.recSetSource.IsValid()) G.recSetSource[r](type);
+    if (G.recFieldSource.IsValid()) G.recFieldSource[r] = type;
+    if (type == 0) {
+        if (G.recSetClip.IsValid()) G.recSetClip[r]((Il2CppObject *)nullptr);
+        else if (G.recFieldClip.IsValid()) G.recFieldClip[r] = (Il2CppObject *)nullptr;
+    }
+}
+static void RecRestart(Il2CppObject *r) {
+    if (G.recRestart1.IsValid()) G.recRestart1[r](true);
+    else if (G.recRestart0.IsValid()) G.recRestart0[r]();
+    try { if (G.recStart.IsValid()) G.recStart[r](); } catch (...) {}   // already recording is fine
+}
+
+static void MicStop() {
+    if (!g_micOn) return;
+    g_micOn = false;
+    g_micUntil = 0;
+    g_micCheckAt = 0;
+    Il2CppObject *r = g_recorder.get();
+    if (!Alive(r)) { g_recorder.clear(); return; }
+    try {
+        RecSetInput(r, 0, nullptr, false);
+        if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](g_micPrevTransmit);
+        if (G.recSetVad.IsValid()) G.recSetVad[r](g_micPrevVad);
+        RecRestart(r);
+        ym::log("clientdabell: voice chat back to your mic");
+    } catch (...) { ym::log("clientdabell: couldn't put the mic back"); }
+}
+
+
+// Switches the recorder to the song. Used on Play, and again if a check finds it didn't take.
+static void MicApply(Il2CppObject *r, Il2CppObject *clip) {
+    RecSetInput(r, 1, clip, f_soundLoop);
+    if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](true);     // sends even with push to talk
+    if (G.recSetVad.IsValid()) G.recSetVad[r](false);              // quiet parts aren't cut off
+    if (G.recSetOnlyWhenEnabled.IsValid()) G.recSetOnlyWhenEnabled[r](false);
+    if (G.recSetRecording.IsValid()) G.recSetRecording[r](true);
+    RecRestart(r);
+}
+static bool MicTookHold(Il2CppObject *r) {
+    if (!Alive(r)) return false;
+    bool src = !G.recGetSource.IsValid() || G.recGetSource[r]() == 1;
+    bool rec = !G.recGetRecording.IsValid() || G.recGetRecording[r]();
+    bool tx = !G.recGetTransmit.IsValid() || G.recGetTransmit[r]();
+    return src && rec && tx;
+}
+
+// Sends the loaded song to the room. Returns false if it only plays for you.
+static bool MicStart() {
+    if (!f_soundMic) return false;
+    // Look the recorder up again on every Play (unless a song is already going through one):
+    // the game can swap its voice object, and an old one would send nothing.
+    if (!g_micOn) g_recorder.clear();
+    Il2CppObject *r = FindRecorder(), *clip = g_clip.get();
+    if (!r || !Alive(clip) || !(G.recSetSource.IsValid() || G.recFieldSource.IsValid())) {
+        ym::log("clientdabell: no voice recorder (type=%d), song plays only for you", G.tRecorder != nullptr);
+        return false;
+    }
+    try {
+        if (!g_micOn) {                                // save your settings once, not on every replay
+            g_micPrevTransmit = G.recGetTransmit.IsValid() ? G.recGetTransmit[r]() : true;
+            g_micPrevVad = G.recGetVad.IsValid() ? G.recGetVad[r]() : false;
+        }
+        g_micOn = true;
+        MicApply(r, clip);
+    } catch (...) {
+        ym::log("clientdabell: voice chat error, putting the mic back");
+        g_micOn = true;
+        MicStop();
+        return false;
+    }
+    g_micUntil = g_time + g_clipLen + 0.5;
+    g_micCheckAt = g_time + 0.4;                       // make sure it took (Photon can ignore it right after joining)
+    g_micTries = 0;
+    return true;
+}
+
+// Every frame: re-check a song that was just sent, and give the mic back when it's over.
+static void SoundTick() {
+    if (!g_micOn) return;
+    if (!f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) { MicStop(); return; }
+    if (g_micCheckAt <= 0 || g_time < g_micCheckAt) return;
+    Il2CppObject *r = g_recorder.get();
+    if (MicTookHold(r)) {
+        if (g_micTries > 0) Notify("The room hears it now");
+        ym::log("clientdabell: voice check ok (after %d retries)", g_micTries);
+        g_micCheckAt = 0;
+        return;
+    }
+    if (g_micTries >= 4) {
+        ym::log("clientdabell: voice chat wouldn't take the song, giving the mic back");
+        Notify("Voice chat didn't take it, only you hear it");
+        MicStop();
+        return;
+    }
+    g_micTries++;
+    if (!Alive(r)) { g_recorder.clear(); r = FindRecorder(); }
+    Il2CppObject *clip = g_clip.get();
+    if (!r || !Alive(clip)) { g_micCheckAt = g_time + 0.75; return; }
+    ym::log("clientdabell: voice didn't take (source=%d recording=%d), retry %d", G.recGetSource.IsValid() ? G.recGetSource[r]() : -1,
+            G.recGetRecording.IsValid() ? (int)G.recGetRecording[r]() : -1, g_micTries);
+    try { MicApply(r, clip); } catch (...) {}
+    g_micCheckAt = g_time + 0.75;
+}
+static void SoundMicToggled() {
+    if (!f_soundMic) MicStop();
+    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+}
+
 static void PlayLoaded() {
     if (!EnsureAudioSource() || !Alive(g_clip.get())) { Notify("Couldn't start the sound"); return; }
     Il2CppObject *src = g_audioSrc.get();
@@ -1833,7 +2142,9 @@ static void PlayLoaded() {
     if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
     if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
     G.asPlay[src]();
-    Notify("Playing %.30s", SongTitle(g_clipSong).c_str());
+    bool room = MicStart();
+    Notify(room ? "Playing %.30s (room hears it)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
+           SongTitle(g_clipSong).c_str());
 }
 
 static void StartLoad(int song, bool playAfter) {
@@ -1846,16 +2157,21 @@ static void StartLoad(int song, bool playAfter) {
     const char *err = "";
     if (!OpenWav(SongsDir() + "/" + g_songs[song], L, &err)) { Notify("%s", err); return; }
     if (L.frames == 0) { fclose(L.f); Notify("That song is empty"); return; }
-    if (L.frames > kMaxFrames) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    if ((double)L.frames / L.rate > kMaxSeconds) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    L.step = (double)L.rate / kVoiceRate;
+    L.outFrames = (uint64_t)((double)L.frames / L.step);
+    if (L.outFrames == 0) L.outFrames = 1;
     if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
     g_clip.clear();
     g_clipSong = -1;
-    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.frames, 1, (int)L.rate, false);
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.outFrames, 1, (int)kVoiceRate, false);
     Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
     if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
     g_clip.set(clip);
     g_chunk.set(chunk);
-    L.buf.resize((size_t)kChunkFrames * L.block);
+    size_t srcMax = (size_t)(kChunkFrames * L.step) + 4;          // file frames one slice can need
+    L.buf.resize(srcMax * L.block);
+    L.mono.resize(srcMax);
     L.song = song;
     L.playWhenDone = playAfter;
     g_load = std::move(L);
@@ -1864,44 +2180,71 @@ static void StartLoad(int song, bool playAfter) {
     Notify("Loading %.30s", SongTitle(song).c_str());
 }
 
-// Called every frame: reads the next slice of the song into the clip (about 32k frames).
+// Called every frame: reads the next slice of the song, mixes it to mono, converts it to
+// 48 kHz (straight-line between samples) and writes 32k frames into the clip.
 static void LoadTick() {
     Loader &L = g_load;
     if (!L.f) return;
     Il2CppObject *clip = g_clip.get();
     if (!Alive(clip)) { AbortLoad(); return; }
-    uint64_t want = L.frames - L.done < kChunkFrames ? L.frames - L.done : kChunkFrames;
-    size_t got = fread(L.buf.data(), 1, (size_t)(want * L.block), L.f);
-    uint64_t n = got / L.block;
-    if (n > 0) {
-        Il2CppObject *arr = n == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+    uint64_t wantOut = L.outFrames - L.outDone < kChunkFrames ? L.outFrames - L.outDone : kChunkFrames;
+    // the file frames this slice needs: up to the one after the last output's position
+    uint64_t needEnd = (uint64_t)((double)(L.outDone + wantOut - 1) * L.step) + 2;
+    if (needEnd > L.frames) needEnd = L.frames;
+    uint64_t readN = needEnd > L.done ? needEnd - L.done : 0;
+    if (readN > L.mono.size()) readN = L.mono.size();
+    uint64_t n = readN ? fread(L.buf.data(), 1, (size_t)(readN * L.block), L.f) / L.block : 0;
+    const int bytes = L.bits / 8;
+    const float inv = 1.0f / (float)L.channels;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t *p = L.buf.data() + i * L.block;
+        float sum = 0;
+        for (int c = 0; c < L.channels; c++) {
+            const uint8_t *q = p + c * bytes;
+            float v;
+            if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
+            else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
+            else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
+            else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
+            else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
+            sum += v;
+        }
+        float m = sum * inv;
+        L.mono[i] = m > 1 ? 1.f : m < -1 ? -1.f : m;
+    }
+    const uint64_t base = L.done;
+    L.done += n;
+    bool fileEnded = n < readN;
+    if (fileEnded && n == 0) wantOut = 0;            // nothing left to read: stop here
+    if (wantOut > 0) {
+        Il2CppObject *arr = wantOut == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)wantOut);
         if (!arr) { AbortLoad(); Notify("Not enough memory for that song"); return; }
         float *dst = (float *)((uint8_t *)arr + 0x20);
-        const int bytes = L.bits / 8;
-        const float inv = 1.0f / (float)L.channels;
-        for (uint64_t i = 0; i < n; i++) {
-            const uint8_t *p = L.buf.data() + i * L.block;
-            float sum = 0;
-            for (int c = 0; c < L.channels; c++) {
-                const uint8_t *q = p + c * bytes;
-                float v;
-                if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
-                else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
-                else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
-                else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
-                else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
-                sum += v;
-            }
-            dst[i] = sum * inv;
+        auto S = [&](uint64_t k) -> float {                           // file sample k, from this slice or the last
+            if (k + 2 == base) return L.prevA;
+            if (k + 1 == base) return L.prevB;
+            if (k < base) return L.prevA;
+            uint64_t j = k - base;
+            return j < n ? L.mono[j] : (n ? L.mono[n - 1] : L.prevB);
+        };
+        for (uint64_t i = 0; i < wantOut; i++) {
+            double pos = (double)(L.outDone + i) * L.step;
+            uint64_t k = (uint64_t)pos;
+            float f = (float)(pos - (double)k), s0 = S(k), s1 = S(k + 1);
+            dst[i] = s0 + (s1 - s0) * f;
         }
-        G.audioClipSetData[clip](arr, (int)L.done);
-        L.done += n;
-        int ten = (int)(L.done * 10 / L.frames);
-        if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+        G.audioClipSetData[clip](arr, (int)L.outDone);
+        L.outDone += wantOut;
     }
-    if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
+    if (n >= 2) { L.prevA = L.mono[n - 2]; L.prevB = L.mono[n - 1]; }
+    else if (n == 1) { L.prevA = L.prevB; L.prevB = L.mono[0]; }
+    int ten = (int)(L.outDone * 10 / L.outFrames);
+    if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+    if (L.outDone >= L.outFrames || wantOut == 0) {                   // finished (or the file ended early)
         bool play = L.playWhenDone;
         int song = L.song;
+        g_clipLen = (double)L.outDone / kVoiceRate;
+        ym::log("clientdabell: loaded %s, %u Hz -> 48000 Hz, %.1f s", g_songs[song].c_str(), L.rate, g_clipLen);
         AbortLoad();
         g_clipSong = song;
         if (play) PlayLoaded();
@@ -1921,10 +2264,17 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+    MicStop();
 }
 static void ApplyLoop() {
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+    Il2CppObject *r = g_recorder.get();
+    if (g_micOn && Alive(r)) {
+        if (G.recSetLoop.IsValid()) G.recSetLoop[r](f_soundLoop);
+        if (G.recFieldLoop.IsValid()) G.recFieldLoop[r] = f_soundLoop;
+        if (!f_soundLoop) g_micUntil = g_time + g_clipLen + 0.5;     // at most one more play-through
+    }
 }
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
@@ -1933,14 +2283,17 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
-// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
-// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
+// ---- effects: snow, rain, thunderstorm (shared with ClientDaBell users) -------------
+// The effect itself is drawn on each client: only a small number (which effect, how heavy)
+// goes out, as a custom property on your Photon player (see RoomWxTick). Other ClientDaBell
+// users in the room read it and run the same effect around themselves; players without the
+// menu receive the property but the game ignores it, so they see nothing. A fixed pool of small cubes (kMaxFx) falls around your
 // head and is reused: a piece that lands, or drifts too far away, restarts above you. The
 // pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
 // the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
 // dim flash of light, and a thunder rumble that is made from noise in code, once.
 static constexpr int kMaxFx = 100;
-static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
+static const int kFxCounts[4][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}, {30, 55, 80}};   // [effect][intensity]
 static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
 static int g_wxIntensity = 1;
 static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
@@ -1954,8 +2307,8 @@ static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
 
 static void WeatherPicked() {
     int picked = -1;
-    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
-    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
+    for (int i = 0; i < 4; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 4; i++) g_wxSel[i] = (i == picked);
     g_wx = picked;
 }
 static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
@@ -1978,6 +2331,7 @@ static void StyleFx(int i, int mode) {
     Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
     if (!Alive(o) || !t) return;
     if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
+    else if (mode == 3) { SetColor(o, Rainbow(i / 17.0f)); G.trSetLocalScale[t](Vector3(0.025f, 0.025f, 0.025f)); }
     else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
 }
 
@@ -2101,6 +2455,124 @@ static void StormTick(Vector3 hp) {
     if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
 }
 
+// ---- disco ------------------------------------------------------------------------
+// A silver ball above your head with colored mirror tiles, spinning; six colored beams
+// sweeping down from it; three colored lights circling you, pulsing to a 120 BPM beat;
+// and the effect pool used as floating rainbow sparkles. Everything is made once, parented
+// to the weather root (so it hides and is destroyed with the other effects), and only
+// moved and recolored after that.
+static constexpr int kDiscoFacets = 14, kDiscoBeams = 6, kDiscoLights = 3;
+static Ref g_discoBall, g_discoFacet[kDiscoFacets], g_discoBeam[kDiscoBeams], g_discoLight[kDiscoLights];
+static bool g_discoShown = false;
+
+static void HideDisco() {
+    if (!g_discoShown) return;
+    g_discoShown = false;
+    Show(g_discoBall, false);
+    for (auto &b : g_discoBeam) Show(b, false);
+    for (auto &l : g_discoLight) if (Alive(l.get())) G.behaviourSetEnabled[l.get()](false);
+}
+static void DiscoClear() {                                     // the objects died with the weather root
+    g_discoBall.clear();
+    for (auto &f : g_discoFacet) f.clear();
+    for (auto &b : g_discoBeam) b.clear();
+    for (auto &l : g_discoLight) l.clear();
+    g_discoShown = false;
+}
+static void LightMethods(Class &light) {
+    if (!g_lightType.IsValid()) g_lightType = light.GetMethod("set_type", 1);
+    if (!g_lightIntensity.IsValid()) g_lightIntensity = light.GetMethod("set_intensity", 1);
+    if (!g_lightRange.IsValid()) g_lightRange = light.GetMethod("set_range", 1);
+    if (!g_lightColor.IsValid()) g_lightColor = light.GetMethod("set_color", 1);
+}
+static void EnsureDisco() {
+    if (!EnsureWxRoot()) return;
+    Il2CppObject *root = Tr(g_wxRoot.get());
+    if (!Alive(g_discoBall.get())) {
+        Il2CppObject *ball = Prim(0, Color(0.78f, 0.80f, 0.86f, 1), false);
+        if (!ball) return;
+        Il2CppObject *bt = Tr(ball);
+        G.trSetParent[bt](root, false);
+        G.trSetLocalScale[bt](Vector3(0.5f, 0.5f, 0.5f));
+        g_discoBall.set(ball);
+        for (int i = 0; i < kDiscoFacets; i++) {               // tiles spread over the ball (a golden-angle spiral)
+            float y = 1 - 2 * (i + 0.5f) / kDiscoFacets, r = sqrtf(1 - y * y), a = i * 2.39996f;
+            Vector3 d(cosf(a) * r, y, sinf(a) * r);
+            Il2CppObject *f = Cube(Rainbow(i / (float)kDiscoFacets), false);
+            if (!f) continue;
+            Il2CppObject *ft = Tr(f);
+            G.trSetParent[ft](bt, false);
+            G.trSetLocalPosition[ft](d * 0.5f);
+            G.trSetLocalRotation[ft](Quaternion::LookRotation(d));
+            G.trSetLocalScale[ft](Vector3(0.2f, 0.2f, 0.04f));
+            g_discoFacet[i].set(f);
+        }
+    }
+    for (int i = 0; i < kDiscoBeams; i++) {
+        if (Alive(g_discoBeam[i].get())) continue;
+        Il2CppObject *b = Cube(Rainbow(i / (float)kDiscoBeams), false);
+        if (!b) continue;
+        G.trSetParent[Tr(b)](root, false);
+        g_discoBeam[i].set(b);
+    }
+    Class light("UnityEngine", "Light");
+    if (!light.IsValid()) return;
+    LightMethods(light);
+    for (int i = 0; i < kDiscoLights; i++) {
+        if (Alive(g_discoLight[i].get())) continue;
+        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellDiscoLight"));
+        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+        if (!l) continue;
+        G.trSetParent[Tr(go)](root, false);
+        if (g_lightType.IsValid()) g_lightType[l](2);              // point light
+        if (g_lightRange.IsValid()) g_lightRange[l](9.0f);
+        g_discoLight[i].set(l);
+    }
+}
+static void DiscoTick(Vector3 hp, int intensity) {
+    EnsureDisco();
+    float t = (float)g_time;
+    float beat = 1.0f - (t * 2.0f - floorf(t * 2.0f));             // 120 BPM: jumps to 1 on each beat, then fades
+    beat = 0.55f + 0.45f * beat * beat;
+    if (!g_discoShown) {
+        g_discoShown = true;
+        Show(g_discoBall, true);
+        for (auto &b : g_discoBeam) Show(b, true);
+    }
+    Vector3 ball = hp + Vector3(0, 2.2f, 0);
+    Il2CppObject *bo = g_discoBall.get();
+    if (Alive(bo)) {
+        Il2CppObject *bt = Tr(bo);
+        float spin = t * 1.2f;
+        G.trSetPosition[bt](ball);
+        G.trSetRotation[bt](Quaternion(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f)));
+    }
+    if (g_frames % 3 == 0)                                          // tiles twinkle through the colors
+        for (int i = 0; i < kDiscoFacets; i++) SetColor(g_discoFacet[i].get(), Rainbow(t * 0.5f + i * 0.37f));
+    const float len = 6.0f, tilt = 0.9f;                            // beams: about 50 degrees down from straight up
+    for (int i = 0; i < kDiscoBeams; i++) {
+        Il2CppObject *b = g_discoBeam[i].get();
+        if (!Alive(b)) continue;
+        float a = t * 0.8f + i * 6.2831853f / kDiscoBeams, wob = tilt + 0.25f * sinf(t * 1.3f + i);
+        Vector3 d(cosf(a) * sinf(wob), -cosf(wob), sinf(a) * sinf(wob));
+        Il2CppObject *bt = Tr(b);
+        G.trSetPosition[bt](ball + d * (len * 0.5f + 0.25f));
+        G.trSetRotation[bt](Quaternion::LookRotation(d));
+        G.trSetLocalScale[bt](Vector3(0.03f, 0.03f, len));
+        if (g_frames % 3 == 1) SetColor(b, Rainbow(t * 0.3f + i / (float)kDiscoBeams));
+    }
+    const float strength[] = {1.5f, 2.5f, 3.5f};
+    for (int i = 0; i < kDiscoLights; i++) {
+        Il2CppObject *l = g_discoLight[i].get();
+        if (!Alive(l)) continue;
+        G.behaviourSetEnabled[l](true);
+        float a = t * 1.1f + i * 6.2831853f / kDiscoLights;
+        G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(cosf(a) * 2.0f, 1.0f, sinf(a) * 2.0f));
+        if (g_lightColor.IsValid()) g_lightColor[l](Rainbow(t * 0.25f + i / (float)kDiscoLights));
+        if (g_lightIntensity.IsValid()) g_lightIntensity[l](strength[intensity] * beat);
+    }
+}
+
 static void WeatherOff() {
     g_wxOn = false;
     g_fxMode = -1;
@@ -2112,6 +2584,7 @@ static void WeatherOff() {
     if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
     if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
     HideBolt();
+    HideDisco();
 }
 static void WeatherReset() {                                   // room change: the old objects are gone
     Kill(g_wxRoot);
@@ -2119,6 +2592,7 @@ static void WeatherReset() {                                   // room change: t
     Kill(g_wxClip);
     for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
     for (int i = 0; i < 7; i++) g_bolt[i].clear();
+    DiscoClear();
     g_wxLight.clear();
     g_wxAudioSrc.clear();
     g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
@@ -2126,8 +2600,93 @@ static void WeatherReset() {                                   // room change: t
     g_wxOn = false;
 }
 
+// ---- room effects sync ------------------------------------------------------------
+// Properties on your player (0 / missing = off):
+//   "cdbWx"  1 + effect * 3 + intensity   (effect 0 snow, 1 rain, 2 storm, 3 disco)
+//   "cdbTod" 1 + time of day              (0 morning, 1 afternoon, 2 sunset, 3 night)
+// Sent only when they change (at most twice a second); others are read once a second.
+static const char *kWxKey = "cdbWx", *kTodKey = "cdbTod";
+static const char *kTodNames[] = {"morning", "afternoon", "sunset", "night"};
+static int g_wxSent = -1, g_roomWx = -1, g_roomWxInt = 1, g_todSent = -1, g_roomTod = -1;
+static double g_nextWxSend = 0, g_nextWxRead = 0;
+static bool g_wxSyncBroken = false;
+
+static int MyWxValue() {
+    if (!f_wxShare || g_wx < 0 || !g_wxSel[g_wx]) return 0;
+    return 1 + g_wx * 3 + g_wxIntensity;
+}
+static int MyTodValue() { return f_wxShare && g_tod >= 0 && g_todSel[g_tod] ? 1 + g_tod : 0; }
+static bool SendProp(const char *key, int v) {
+    Il2CppObject *me = G.pnLocalPlayer.IsValid() ? G.pnLocalPlayer() : nullptr;
+    if (!me || !G.plSetProps.IsValid() || !G.htSet.IsValid() || !G.htClass.IsValid() || !G.valueBox || !G.intClass) return false;
+    Il2CppObject *table = G.htClass.CreateNewObjectParameters();
+    if (!table) return false;
+    // null removes the property for everyone, so nothing is left behind when you switch off
+    void *boxed = v ? G.valueBox(G.intClass, &v) : nullptr;
+    G.htSet[table]((Il2CppObject *)CreateMonoString(key), (Il2CppObject *)boxed);
+    Method<bool> set = G.plSetProps;
+    if (G.plSetPropsArgs == 3) set[me](table, (Il2CppObject *)nullptr, (Il2CppObject *)nullptr);
+    else set[me](table);
+    return true;
+}
+static int ReadProp(Il2CppObject *player, const char *key, int max) {
+    Il2CppObject *props = G.plGetProps[player]();
+    if (!props) return 0;
+    auto *o = (Il2CppObject *)G.htGet[props]((Il2CppObject *)CreateMonoString(key));
+    if (!o || o->klass != G.intClass) return 0;
+    int v = *(int *)((uint8_t *)o + sizeof(Il2CppObject));
+    return v >= 1 && v <= max ? v : 0;
+}
+static void RoomWxTick() {
+    if (g_wxSyncBroken) return;
+    try {
+        int mine = MyWxValue(), myTod = MyTodValue();
+        if ((mine != g_wxSent || myTod != g_todSent) && g_time >= g_nextWxSend) {
+            g_nextWxSend = g_time + 0.5;
+            if (mine != g_wxSent && SendProp(kWxKey, mine)) g_wxSent = mine;
+            if (myTod != g_todSent && SendProp(kTodKey, myTod)) g_todSent = myTod;
+        }
+        if (g_time < g_nextWxRead) return;
+        g_nextWxRead = g_time + 1.0;
+        int found = 0, foundTod = 0;
+        std::string nick, todNick;
+        if (f_wxShare && G.pnOthers.IsValid() && G.plGetProps.IsValid() && G.htGet.IsValid()) {
+            auto *arr = (uint8_t *)G.pnOthers();
+            uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+            auto NickOf = [](Il2CppObject *pl) {
+                auto *s = G.plGetNick.IsValid() ? G.plGetNick[pl]() : nullptr;
+                std::string n = s ? s->str() : "";
+                return n.empty() ? std::string("Someone") : n;
+            };
+            for (uintptr_t i = 0; i < n && i < 64 && !(found && foundTod); i++) {   // the first player with each one
+                Il2CppObject *pl = ((Il2CppObject **)(arr + 0x20))[i];
+                if (!pl) continue;
+                if (!found && (found = ReadProp(pl, kWxKey, 12))) nick = NickOf(pl);
+                if (!foundTod && (foundTod = ReadProp(pl, kTodKey, 4))) todNick = NickOf(pl);
+            }
+        }
+        int mode = found ? (found - 1) / 3 : -1;
+        if (mode != g_roomWx && mode >= 0 && !(g_wx >= 0 && g_wxSel[g_wx]))
+            Notify("%s started %s", nick.c_str(), mode == 0 ? "snow" : mode == 1 ? "rain" : mode == 2 ? "a thunderstorm" : "a disco");
+        g_roomWx = mode;
+        g_roomWxInt = found ? (found - 1) % 3 : 1;
+        int tod = foundTod ? foundTod - 1 : -1;
+        if (tod != g_roomTod && tod >= 0 && !(g_tod >= 0 && g_todSel[g_tod]))
+            Notify("%s set the time to %s", todNick.c_str(), kTodNames[tod]);
+        g_roomTod = tod;
+    } catch (...) {
+        g_wxSyncBroken = true;                       // don't retry every frame; your own effects still work
+        g_roomWx = -1;
+        g_roomTod = -1;
+        ym::log("clientdabell: room effects error, sharing off for this session");
+    }
+}
+static void RoomWxReset() { g_wxSent = g_todSent = -1; g_roomWx = g_roomTod = -1; g_nextWxSend = g_nextWxRead = 0; }
+
 static void WeatherTick(float dt) {
-    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
+    bool own = g_wx >= 0 && g_wxSel[g_wx];
+    int mode = own ? g_wx : g_roomWx;                          // yours wins; else the room's
+    int intensity = own ? g_wxIntensity : g_roomWxInt;
     Il2CppObject *head = g_head.get();
     if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
     if (!EnsureWxRoot()) return;
@@ -2140,7 +2699,7 @@ static void WeatherTick(float dt) {
         bool found = G.raycast.IsValid() && G.raycast(hp, Vector3(0, -1, 0), &hit, 8.0f, mask ? mask : -5);
         g_groundY = found ? hit.point.y : hp.y - 2.5f;
     }
-    int want = kFxCounts[mode][g_wxIntensity];
+    int want = kFxCounts[mode][intensity];
     for (int n = 0; n < 25 && g_fxMade < kMaxFx; n++) {        // make the pool a few pieces per frame
         Il2CppObject *o = Prim(3, Color(1, 1, 1, 1), false);
         if (!o) break;
@@ -2171,16 +2730,297 @@ static void WeatherTick(float dt) {
             p.y -= 1.1f * dt;
             p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
             p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
+        } else if (mode == 3) {                                // disco: sparkles float and circle around you
+            float dx = p.x - hp.x, dz = p.z - hp.z;
+            p.x += -dz * 0.25f * dt;
+            p.z += dx * 0.25f * dt;
+            p.y += sinf(t * 2.0f + g_fxPhase[i]) * 0.25f * dt;
+            if ((g_frames + i) % 4 == 0) SetColor(g_fx[i].get(), Rainbow(t * 0.4f + g_fxPhase[i]));
         } else {                                               // rain: fast, a little wind
             p.y -= 9.0f * dt;
             p.x += 0.6f * dt;
         }
         float dx = p.x - hp.x, dz = p.z - hp.z;
-        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, mode == 3);
         if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
     }
     if (mode == 2) StormTick(hp);
     else { HideBolt(); g_nextBolt = 0; }
+    if (mode == 3) DiscoTick(hp, intensity);
+    else HideDisco();
+}
+
+// ---- time of day: morning, afternoon, sunset, night ------------------------------------
+// Changes the scene's sky, light and fog on your own game, plus a sun or moon and stars of
+// our own (they are what you see for sure, even where the map's lighting is baked). Your
+// pick is shared like the weather (see RoomWxTick). The game's own values are saved the
+// first time and put back when you switch it off.
+struct TodPreset {
+    float az, el;                 // where the sun (or moon) is, in degrees
+    Color light; float lightI;    // the scene's directional lights
+    Color ambient;
+    Color sky; float exposure;    // skybox tint and brightness
+    bool fog; Color fogC; float fogStart, fogEnd;
+    Color ball; float ballSize; bool moon, stars;
+};
+static const TodPreset kTod[4] = {
+    {  0, 15, Color(1.0f, 0.86f, 0.70f, 1), 1.0f,  Color(0.55f, 0.55f, 0.60f, 1), Color(0.80f, 0.82f, 0.95f, 1), 1.1f,
+       true, Color(0.86f, 0.86f, 0.92f, 1), 30, 260, Color(1.0f, 0.88f, 0.60f, 1), 7, false, false},
+    { 30, 65, Color(1.0f, 0.97f, 0.92f, 1), 1.25f, Color(0.70f, 0.72f, 0.76f, 1), Color(0.55f, 0.70f, 1.00f, 1), 1.3f,
+       false, Color(1, 1, 1, 1), 0, 0,             Color(1.0f, 0.98f, 0.85f, 1), 6, false, false},
+    {180,  4, Color(1.0f, 0.50f, 0.25f, 1), 0.9f,  Color(0.55f, 0.38f, 0.35f, 1), Color(1.00f, 0.55f, 0.35f, 1), 0.9f,
+       true, Color(0.95f, 0.52f, 0.36f, 1), 40, 260, Color(1.0f, 0.45f, 0.15f, 1), 10, false, false},
+    {220, 45, Color(0.55f, 0.65f, 1.0f, 1), 0.25f, Color(0.08f, 0.09f, 0.16f, 1), Color(0.08f, 0.10f, 0.25f, 1), 0.25f,
+       true, Color(0.03f, 0.04f, 0.09f, 1), 15, 120, Color(0.90f, 0.92f, 1.0f, 1), 1.8f, true, true},
+};
+static constexpr int kStars = 60, kMaxTodLights = 8;
+
+static struct {
+    bool init = false;
+    Method<int> ambMode, fogMode, lType;
+    Method<Color> ambLight, fogColor, matGetColor, lColor;
+    Method<float> ambInt, fogStart, fogEnd, matGetFloat, lIntensity;
+    Method<bool> fog, matHas;
+    Method<void> setAmbMode, setAmbLight, setAmbInt, setFog, setFogMode, setFogColor, setFogStart, setFogEnd,
+                 matSetColorN, matSetFloat;
+    Method<Il2CppObject *> sky;
+} TD;
+static void TodInit() {
+    if (TD.init) return;
+    TD.init = true;
+    Class rs("UnityEngine", "RenderSettings"), mat("UnityEngine", "Material"), light("UnityEngine", "Light");
+    if (rs.IsValid()) {
+        TD.ambMode = rs.GetMethod("get_ambientMode", 0);      TD.setAmbMode = rs.GetMethod("set_ambientMode", 1);
+        TD.ambLight = rs.GetMethod("get_ambientLight", 0);    TD.setAmbLight = rs.GetMethod("set_ambientLight", 1);
+        TD.ambInt = rs.GetMethod("get_ambientIntensity", 0);  TD.setAmbInt = rs.GetMethod("set_ambientIntensity", 1);
+        TD.fog = rs.GetMethod("get_fog", 0);                  TD.setFog = rs.GetMethod("set_fog", 1);
+        TD.fogMode = rs.GetMethod("get_fogMode", 0);          TD.setFogMode = rs.GetMethod("set_fogMode", 1);
+        TD.fogColor = rs.GetMethod("get_fogColor", 0);        TD.setFogColor = rs.GetMethod("set_fogColor", 1);
+        TD.fogStart = rs.GetMethod("get_fogStartDistance", 0); TD.setFogStart = rs.GetMethod("set_fogStartDistance", 1);
+        TD.fogEnd = rs.GetMethod("get_fogEndDistance", 0);    TD.setFogEnd = rs.GetMethod("set_fogEndDistance", 1);
+        TD.sky = rs.GetMethod("get_skybox", 0);
+    }
+    if (mat.IsValid()) {
+        TD.matHas = Overload(mat, "HasProperty", {"System.String"});
+        TD.matGetColor = Overload(mat, "GetColor", {"System.String"});
+        TD.matSetColorN = Overload(mat, "SetColor", {"System.String", "UnityEngine.Color"});
+        TD.matGetFloat = Overload(mat, "GetFloat", {"System.String"});
+        TD.matSetFloat = Overload(mat, "SetFloat", {"System.String", "System.Single"});
+    }
+    if (light.IsValid()) {
+        LightMethods(light);
+        TD.lType = light.GetMethod("get_type", 0);
+        TD.lColor = light.GetMethod("get_color", 0);
+        TD.lIntensity = light.GetMethod("get_intensity", 0);
+    }
+    ym::log("clientdabell: time of day render=%d fog=%d sky=%d mat=%d/%d light=%d/%d", TD.setAmbLight.IsValid(),
+            TD.setFog.IsValid(), TD.sky.IsValid(), TD.matHas.IsValid(), TD.matSetFloat.IsValid(),
+            TD.lType.IsValid(), g_lightIntensity.IsValid());
+}
+
+// What the scene had before we changed it.
+static struct {
+    bool saved = false;
+    int ambMode = 0, fogMode = 1; Color ambLight, fogColor; float ambInt = 1, fogStart = 0, fogEnd = 300; bool fog = false;
+    Ref sky; bool hasTint = false, hasSkyTint = false, hasExposure = false; Color tint, skyTint; float exposure = 1;
+    Ref light[kMaxTodLights]; Color lightC[kMaxTodLights]; float lightI[kMaxTodLights]; Quaternion lightR[kMaxTodLights];
+    int lights = 0;
+} TS;
+static Ref g_todRoot, g_todBall, g_todStar[kStars], g_todOwnLight;
+static Vector3 g_starDir[kStars];
+static int g_todShown = -1;
+static double g_nextTodApply = 0;
+
+static void TodPicked() {
+    int picked = -1;
+    for (int i = 0; i < 4; i++) if (g_todSel[i] && i != g_tod) picked = i;
+    for (int i = 0; i < 4; i++) g_todSel[i] = (i == picked);
+    g_tod = picked;
+}
+static Vector3 SkyDir(float azDeg, float elDeg) {
+    float az = azDeg * 0.0174533f, el = elDeg * 0.0174533f;
+    return Vector3(cosf(el) * cosf(az), sinf(el), cosf(el) * sinf(az));
+}
+static Il2CppObject *StrArg(const char *s) { return (Il2CppObject *)CreateMonoString(s); }
+
+static void TodSave() {
+    if (TS.saved) return;
+    TS.saved = true;
+    if (TD.ambMode.IsValid()) TS.ambMode = TD.ambMode();
+    if (TD.ambLight.IsValid()) TS.ambLight = TD.ambLight();
+    if (TD.ambInt.IsValid()) TS.ambInt = TD.ambInt();
+    if (TD.fog.IsValid()) TS.fog = TD.fog();
+    if (TD.fogMode.IsValid()) TS.fogMode = TD.fogMode();
+    if (TD.fogColor.IsValid()) TS.fogColor = TD.fogColor();
+    if (TD.fogStart.IsValid()) TS.fogStart = TD.fogStart();
+    if (TD.fogEnd.IsValid()) TS.fogEnd = TD.fogEnd();
+    Il2CppObject *sky = TD.sky.IsValid() ? TD.sky() : nullptr;
+    if (Alive(sky) && TD.matHas.IsValid()) {
+        TS.sky.set(sky);
+        // Unity's built-in skyboxes use _Tint (cubemap / 6-sided) or _SkyTint (procedural), plus _Exposure
+        if ((TS.hasTint = TD.matHas[sky](StrArg("_Tint")))) TS.tint = TD.matGetColor[sky](StrArg("_Tint"));
+        if ((TS.hasSkyTint = TD.matHas[sky](StrArg("_SkyTint")))) TS.skyTint = TD.matGetColor[sky](StrArg("_SkyTint"));
+        if ((TS.hasExposure = TD.matHas[sky](StrArg("_Exposure")))) TS.exposure = TD.matGetFloat[sky](StrArg("_Exposure"));
+    }
+    TS.lights = 0;
+    Class light("UnityEngine", "Light");
+    if (light.IsValid() && TD.lType.IsValid() && (G.findScene.IsValid() || G.findSceneByType.IsValid())) {
+        auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)light.GetMonoType())
+                                                      : G.findSceneByType((Il2CppObject *)light.GetMonoType(), 0));
+        uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        for (uintptr_t i = 0; i < n && TS.lights < kMaxTodLights; i++) {
+            Il2CppObject *l = ((Il2CppObject **)(arr + 0x20))[i];
+            if (!Alive(l) || TD.lType[l]() != 1) continue;          // 1 = Directional
+            int k = TS.lights++;
+            TS.light[k].set(l);
+            TS.lightC[k] = TD.lColor[l]();
+            TS.lightI[k] = TD.lIntensity[l]();
+            TS.lightR[k] = G.trGetRotation[Tr(G.compGameObject[l]())]();
+        }
+    }
+    ym::log("clientdabell: time of day saved: sky=%d tint=%d/%d exposure=%d, %d sun lights", Alive(sky) ? 1 : 0,
+            TS.hasTint, TS.hasSkyTint, TS.hasExposure, TS.lights);
+}
+// sceneToo = false after a room change, when RenderSettings may already belong to a new scene
+static void TodRestore(bool sceneToo) {
+    if (!TS.saved) return;
+    if (sceneToo) {
+        if (TD.setAmbMode.IsValid()) TD.setAmbMode(TS.ambMode);
+        if (TD.setAmbLight.IsValid()) TD.setAmbLight(TS.ambLight);
+        if (TD.setAmbInt.IsValid()) TD.setAmbInt(TS.ambInt);
+        if (TD.setFog.IsValid()) TD.setFog(TS.fog);
+        if (TD.setFogMode.IsValid()) TD.setFogMode(TS.fogMode);
+        if (TD.setFogColor.IsValid()) TD.setFogColor(TS.fogColor);
+        if (TD.setFogStart.IsValid()) TD.setFogStart(TS.fogStart);
+        if (TD.setFogEnd.IsValid()) TD.setFogEnd(TS.fogEnd);
+    }
+    Il2CppObject *sky = TS.sky.get();                  // the skybox is an asset: always put it back
+    if (Alive(sky)) {
+        if (TS.hasTint) TD.matSetColorN[sky](StrArg("_Tint"), TS.tint);
+        if (TS.hasSkyTint) TD.matSetColorN[sky](StrArg("_SkyTint"), TS.skyTint);
+        if (TS.hasExposure) TD.matSetFloat[sky](StrArg("_Exposure"), TS.exposure);
+    }
+    for (int k = 0; k < TS.lights; k++) {
+        Il2CppObject *l = TS.light[k].get();
+        if (Alive(l)) {
+            g_lightColor[l](TS.lightC[k]);
+            g_lightIntensity[l](TS.lightI[k]);
+            G.trSetRotation[Tr(G.compGameObject[l]())](TS.lightR[k]);
+        }
+        TS.light[k].clear();
+    }
+    TS.lights = 0;
+    TS.sky.clear();
+    TS.saved = false;
+}
+static void EnsureTodObjects() {
+    if (Alive(g_todRoot.get())) return;
+    Il2CppObject *root = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellSky"));
+    if (!root) return;
+    g_todRoot.set(root);
+    Il2CppObject *rt = Tr(root);
+    if (Il2CppObject *ball = Prim(0, Color(1, 1, 1, 1), false)) { G.trSetParent[Tr(ball)](rt, false); g_todBall.set(ball); }
+    for (int i = 0; i < kStars; i++) {
+        Il2CppObject *st = Cube(Color(0.92f, 0.94f, 1.0f, 1), false);
+        if (!st) continue;
+        float az = Rand01() * 360.0f, el = 15.0f + Rand01() * 70.0f, size = 0.12f + Rand01() * 0.16f;
+        g_starDir[i] = SkyDir(az, el);
+        Il2CppObject *t = Tr(st);
+        G.trSetParent[t](rt, false);
+        G.trSetLocalPosition[t](g_starDir[i] * 34.0f);       // inside the night fog's start, so they stay visible
+        G.trSetLocalScale[t](Vector3(size, size, size));
+        g_todStar[i].set(st);
+    }
+    G.goSetActive[root](false);
+}
+static void TodApply(int tod) {
+    const TodPreset &p = kTod[tod];
+    Vector3 toSun = SkyDir(p.az, p.el);
+    if (TD.setAmbMode.IsValid()) TD.setAmbMode(3);                 // Flat
+    if (TD.setAmbLight.IsValid()) TD.setAmbLight(p.ambient);
+    if (TD.setAmbInt.IsValid()) TD.setAmbInt(1.0f);
+    if (TD.setFog.IsValid()) TD.setFog(p.fog || TS.fog);
+    if (p.fog) {
+        if (TD.setFogMode.IsValid()) TD.setFogMode(1);              // Linear
+        if (TD.setFogColor.IsValid()) TD.setFogColor(p.fogC);
+        if (TD.setFogStart.IsValid()) TD.setFogStart(p.fogStart);
+        if (TD.setFogEnd.IsValid()) TD.setFogEnd(p.fogEnd);
+    } else if (TS.fog) {                                            // keep the map's own fog, recolored to the sky
+        if (TD.setFogColor.IsValid()) TD.setFogColor(p.sky);
+    }
+    Il2CppObject *sky = TS.sky.get();
+    if (Alive(sky)) {
+        if (TS.hasTint) TD.matSetColorN[sky](StrArg("_Tint"), Color(p.sky.r * 0.5f, p.sky.g * 0.5f, p.sky.b * 0.5f, 1));   // 0.5 is "no tint"
+        if (TS.hasSkyTint) TD.matSetColorN[sky](StrArg("_SkyTint"), p.sky);
+        if (TS.hasExposure) TD.matSetFloat[sky](StrArg("_Exposure"), p.exposure);
+    }
+    Quaternion rot = Quaternion::LookRotation(Vector3(0, 0, 0) - toSun);
+    for (int k = 0; k < TS.lights; k++) {
+        Il2CppObject *l = TS.light[k].get();
+        if (!Alive(l)) continue;
+        g_lightColor[l](p.light);
+        g_lightIntensity[l](p.lightI);
+        G.trSetRotation[Tr(G.compGameObject[l]())](rot);
+    }
+    if (TS.lights == 0 && Alive(g_todRoot.get())) {                // the map has no sun light: use our own
+        if (!Alive(g_todOwnLight.get())) {
+            Class light("UnityEngine", "Light");
+            Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellSun"));
+            Il2CppObject *l = go && light.IsValid() ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+            if (l) { G.trSetParent[Tr(go)](Tr(g_todRoot.get()), false); if (g_lightType.IsValid()) g_lightType[l](1); g_todOwnLight.set(l); }
+        }
+        Il2CppObject *l = g_todOwnLight.get();
+        if (Alive(l)) {
+            g_lightColor[l](p.light);
+            g_lightIntensity[l](p.lightI * 0.6f);
+            G.trSetRotation[Tr(G.compGameObject[l]())](rot);
+        }
+    }
+}
+static void TodOff() {
+    if (g_todShown < 0) return;
+    g_todShown = -1;
+    Show(g_todRoot, false);
+    TodRestore(true);
+}
+static void TodReset() {                                           // room change
+    Il2CppObject *sky = TD.sky.IsValid() ? TD.sky() : nullptr;
+    TodRestore(TS.saved && sky && sky == TS.sky.get());            // same scene still: put everything back
+    Kill(g_todRoot);
+    g_todBall.clear(); g_todOwnLight.clear();
+    for (auto &s : g_todStar) s.clear();
+    g_todShown = -1;
+    g_nextTodApply = 0;
+}
+static void TodTick() {
+    bool own = g_tod >= 0 && g_todSel[g_tod];
+    int tod = own ? g_tod : g_roomTod;
+    Il2CppObject *head = g_head.get();
+    if (tod < 0 || !head) { TodOff(); return; }
+    TodInit();
+    TodSave();
+    EnsureTodObjects();
+    const TodPreset &p = kTod[tod];
+    if (tod != g_todShown) {                                       // new pick: restyle the sky objects
+        g_todShown = tod;
+        g_nextTodApply = 0;
+        Show(g_todRoot, true);
+        Il2CppObject *ball = g_todBall.get();
+        if (Alive(ball)) {
+            float dist = p.moon ? 34.0f : 120.0f;
+            Il2CppObject *bt = Tr(ball);
+            G.trSetLocalPosition[bt](SkyDir(p.az, p.el) * dist);
+            G.trSetLocalScale[bt](Vector3(p.ballSize, p.ballSize, p.ballSize));
+            SetColor(ball, p.ball);
+        }
+        for (auto &s : g_todStar) Show(s, p.stars);
+    }
+    Il2CppObject *root = g_todRoot.get();
+    if (Alive(root)) G.trSetPosition[Tr(root)](G.trGetPosition[head]());   // the sky follows you
+    if (g_time >= g_nextTodApply) {                                // again now and then, in case the game resets it
+        g_nextTodApply = g_time + 0.5;
+        TodApply(tod);
+    }
 }
 
 // ---- Overpowered (all of it changes only your own body; nothing is sent) ---------------
@@ -2599,12 +3439,16 @@ static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
+    try { MicStop(); } catch (...) {}             // the voice object can outlive the room: give it your mic back
+    g_recorder.clear();
     for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
     g_audioSrc.clear();
     PauseTrackers(false);
     g_dancing = false;
     g_gunLine.clear();
     WeatherReset();
+    try { TodReset(); } catch (...) {}
+    RoomWxReset();
     OverpoweredReset();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
         Buttons none;                             // trigger "released"
@@ -2647,6 +3491,8 @@ static void OnUpdate(float dt) {
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
+    StickFlyTick(in, dt);
+    DashTick(in);
     LowGravityTick(in, dt);
     PlatformFor(in.lgrip, g_leftPlatform, g_leftHand);
     PlatformFor(in.rgrip, g_rightPlatform, g_rightHand);
@@ -2659,10 +3505,13 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
-    try { LoadTick(); }
+    try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
+    RoomWxTick();
     try { WeatherTick(dt); }
     catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
+    try { TodTick(); }
+    catch (...) { g_tod = -1; for (bool &b : g_todSel) b = false; try { TodOff(); } catch (...) {} ym::log("clientdabell: time of day error, turned off"); }
     try { OverpoweredTick(in, dt); }
     catch (...) {
         for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) *it.flag = false;
