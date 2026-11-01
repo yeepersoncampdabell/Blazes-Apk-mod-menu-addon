@@ -91,6 +91,7 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
     // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
     BNM::MonoType *tRecorder = nullptr;
@@ -167,6 +168,7 @@ static bool Lookups() {
             G.asSetLoop = asrc.GetMethod("set_loop", 1);
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
+            G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
@@ -2044,6 +2046,10 @@ static bool MicStart() {
             g_micPrevTransmit = G.recGetTransmit.IsValid() ? G.recGetTransmit[r]() : true;
             g_micPrevVad = G.recGetVad.IsValid() ? G.recGetVad[r]() : false;
         }
+        // Stop recording first so the Recorder starts clean on the song. Without this, a
+        // Recorder that went back to your mic (Others Hear It off, or Stop) could keep
+        // sending the mic and ignore the song the next time.
+        if (!g_micOn && G.recSetRecording.IsValid()) G.recSetRecording[r](false);
         g_micOn = true;
         MicApply(r, clip);
     } catch (...) {
@@ -2085,9 +2091,15 @@ static void SoundTick() {
     try { MicApply(r, clip); } catch (...) {}
     g_micCheckAt = g_time + 0.75;
 }
+static void PlayLoaded();
 static void SoundMicToggled() {
-    if (!f_soundMic) MicStop();
-    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+    if (!f_soundMic) { MicStop(); Notify("Soundboard: only you hear it"); return; }
+    // Switched back on while a song plays only for you: start it over through voice chat,
+    // so you and the room hear it from the same spot.
+    Il2CppObject *src = g_audioSrc.get();
+    bool playing = Alive(src) && G.asIsPlaying.IsValid() && G.asIsPlaying[src]();
+    if (playing && !g_micOn && !g_load.f && Alive(g_clip.get())) { PlayLoaded(); return; }
+    Notify("Soundboard: the room hears it");
 }
 
 static void PlayLoaded() {
@@ -2220,7 +2232,8 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
-    MicStop();
+    MicStop();                             // gives the mic back first, then
+    g_recorder.clear();                    // the voice object is looked up fresh on the next Play
 }
 static void ApplyLoop() {
     Il2CppObject *src = g_audioSrc.get();
