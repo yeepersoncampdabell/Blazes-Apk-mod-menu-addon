@@ -127,8 +127,7 @@ static struct {
     Method<void> goSetLayer;
     BNM::MonoType *tRigidbody = nullptr, *tCollider = nullptr, *tCanvas = nullptr, *tText = nullptr,
                   *tFont = nullptr, *tRenderer = nullptr, *tMeshCollider = nullptr, *tLine = nullptr;
-    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger, usageStick, usageStickClick;
-    Method<bool> tryGetVec2;            // thumbsticks
+    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
 } G;
 
 static bool Lookups() {
@@ -232,9 +231,6 @@ static bool Lookups() {
     G.rtSetSizeDelta = rt.GetMethod("set_sizeDelta", 1);
     G.deviceAtNode = dev.GetMethod("GetDeviceAtXRNode", 1);
     G.tryGetBool = dev.GetMethod("TryGetFeatureValue_bool", 3);
-    for (const char *n : {"TryGetFeatureValue_Vector2f", "TryGetFeatureValue_Vector2"})
-        if (!G.tryGetVec2.IsValid()) G.tryGetVec2 = dev.GetMethod(n, 3);
-    ym::log("clientdabell: thumbsticks %d", G.tryGetVec2.IsValid());
     G.haptic = dev.GetMethod("SendHapticImpulse", 4);    // optional: a small buzz on press
     G.leftHand = player.GetField("leftHandTransform");
     G.rightHand = player.GetField("rightHandTransform");
@@ -324,8 +320,6 @@ static bool Lookups() {
     G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
     G.usageGrip.set((Il2CppObject *)CreateMonoString("GripButton"));
     G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
-    G.usageStick.set((Il2CppObject *)CreateMonoString("Primary2DAxis"));
-    G.usageStickClick.set((Il2CppObject *)CreateMonoString("Primary2DAxisClick"));
     for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
         if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
     // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
@@ -400,20 +394,11 @@ static void SetText(Ref &text, const char *s) {
 
 // ---- input -------------------------------------------------------------------
 
-struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false,
-                 lclick = false, rclick = false; Vector2 lstick = Vector2(0, 0), rstick = Vector2(0, 0); };
+struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false; };
 static bool Pressed(int node, Ref &usage) {
     XRDevice d = G.deviceAtNode(node);
     bool v = false;
     if (d.initialized) G.tryGetBool(d.id, (BNM::Structures::Mono::String *)usage.get(), &v);
-    return v;
-}
-static Vector2 Stick(int node) {
-    Vector2 v(0, 0);
-    if (!G.tryGetVec2.IsValid()) return v;
-    XRDevice d = G.deviceAtNode(node);
-    if (d.initialized) G.tryGetVec2(d.id, (BNM::Structures::Mono::String *)G.usageStick.get(), &v);
-    if (v.x * v.x + v.y * v.y < 0.15f * 0.15f) v = Vector2(0, 0);   // dead zone
     return v;
 }
 static Buttons ReadButtons() {
@@ -423,8 +408,6 @@ static Buttons ReadButtons() {
     b.a = Pressed(right, G.usagePrimary); b.b = Pressed(right, G.usageSecondary);
     b.lgrip = Pressed(left, G.usageGrip); b.rgrip = Pressed(right, G.usageGrip);
     b.ltrig = Pressed(left, G.usageTrigger); b.rtrig = Pressed(right, G.usageTrigger);
-    b.lclick = Pressed(left, G.usageStickClick); b.rclick = Pressed(right, G.usageStickClick);
-    b.lstick = Stick(left); b.rstick = Stick(right);
     return b;
 }
 
@@ -432,7 +415,7 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
@@ -526,8 +509,6 @@ static Item g_items[] = {
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
     {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
-    {MOVEMENT, "Thumbstick Fly", TOGGLE, MAIN, &f_stickFly},
-    {MOVEMENT, "Dash", TOGGLE, MAIN, &f_dash},
 
 
     {EMOTES, "Exit Emotes", OPEN, MAIN},
@@ -572,7 +553,7 @@ static Item g_items[] = {
     {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
     {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
     {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
-    {EFFECTS, "Disco", TOGGLE, MAIN, &g_wxSel[3], WeatherPicked},
+    {EFFECTS, "Disco Party", TOGGLE, MAIN, &g_wxSel[3], WeatherPicked},
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
     {EFFECTS, "Morning", TOGGLE, MAIN, &g_todSel[0], TodPicked},
     {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
@@ -664,7 +645,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Afternoon", "High sun and a bright blue sky."},
     {"Sunset", "An orange sky with the sun on the horizon."},
     {"Night", "Dark sky, moon and stars."},
-    {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
+    {"Disco Party", "A spinning disco ball with colored beams, lights and sparkles."},
     {"Snow", "Snow falls around you."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
@@ -684,8 +665,6 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Floss", "Hold left trigger to floss."},
     {"Dab", "Hold left trigger to dab."},
     {"Bounce", "Bounce back up every time you land."},
-    {"Thumbstick Fly", "Left stick flies where you look, right stick goes up and down."},
-    {"Dash", "Click the right thumbstick to dash where you look."},
     {"Fling Gun", "Press A (X) to fling yourself where you point."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
@@ -1207,35 +1186,9 @@ static void FlyTick(const Buttons &in, float dt) {
     StopMoving();
 }
 
-// Thumbstick Fly: you hover, and the sticks move you (left: forward/back and sideways where
-// you look, right: up/down). Moves your body like Fly does, so the room sees you fly.
-static void StickFlyTick(const Buttons &in, float dt) {
-    Il2CppObject *head = g_head.get(), *t = PlayerTransform();
-    if (!f_stickFly || !head || !t) return;
-    float speed = f_fastFly ? 20.0f : 8.0f;
-    Vector3 move = G.trGetForward[head]() * in.lstick.y + G.trGetRight[head]() * in.lstick.x + Vector3(0, in.rstick.y, 0);
-    G.trSetPosition[t](G.trGetPosition[t]() + move * (speed * dt));
-    StopMoving();
-    Il2CppObject *player = g_player.get();
-    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
-}
-
-// Dash: one quick burst where you look on each right-thumbstick click.
-static bool g_dashPrev = false;
-static double g_nextDash = 0;
-static void DashTick(const Buttons &in) {
-    bool press = in.rclick && !g_dashPrev;
-    g_dashPrev = in.rclick;
-    Il2CppObject *head = g_head.get(), *player = g_player.get();
-    if (!f_dash || !press || !head || g_time < g_nextDash) return;
-    g_nextDash = g_time + 0.5;
-    SetVel(G.trGetForward[head]() * 16.0f);
-    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.15f);
-}
-
 static void LowGravityTick(const Buttons &in, float dt) {
     Vector3 v;
-    if (!f_lowGravity || f_noGravity || f_stickFly || (f_fly && in.a) || !GetVel(v)) return;
+    if (!f_lowGravity || f_noGravity || (f_fly && in.a) || !GetVel(v)) return;
     SetVel(v + Vector3(0, 9.81f * 0.7f * dt, 0));       // cancels 70% of gravity
 }
 
@@ -3371,8 +3324,6 @@ static void OnUpdate(float dt) {
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
-    StickFlyTick(in, dt);
-    DashTick(in);
     LowGravityTick(in, dt);
     PlatformFor(in.lgrip, g_leftPlatform, g_leftHand);
     PlatformFor(in.rgrip, g_rightPlatform, g_rightHand);
