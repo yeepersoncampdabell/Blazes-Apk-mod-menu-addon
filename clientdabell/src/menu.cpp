@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.3"
+#define CDB_VERSION "v1.2.4"
 
 // ---- small helpers ---------------------------------------------------------
 
