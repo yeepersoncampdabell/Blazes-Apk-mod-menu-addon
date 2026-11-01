@@ -127,8 +127,7 @@ static struct {
     Method<void> goSetLayer;
     BNM::MonoType *tRigidbody = nullptr, *tCollider = nullptr, *tCanvas = nullptr, *tText = nullptr,
                   *tFont = nullptr, *tRenderer = nullptr, *tMeshCollider = nullptr, *tLine = nullptr;
-    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger, usageStick, usageStickClick;
-    Method<bool> tryGetVec2;            // thumbsticks
+    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
 } G;
 
 static bool Lookups() {
@@ -232,9 +231,6 @@ static bool Lookups() {
     G.rtSetSizeDelta = rt.GetMethod("set_sizeDelta", 1);
     G.deviceAtNode = dev.GetMethod("GetDeviceAtXRNode", 1);
     G.tryGetBool = dev.GetMethod("TryGetFeatureValue_bool", 3);
-    for (const char *n : {"TryGetFeatureValue_Vector2f", "TryGetFeatureValue_Vector2"})
-        if (!G.tryGetVec2.IsValid()) G.tryGetVec2 = dev.GetMethod(n, 3);
-    ym::log("clientdabell: thumbsticks %d", G.tryGetVec2.IsValid());
     G.haptic = dev.GetMethod("SendHapticImpulse", 4);    // optional: a small buzz on press
     G.leftHand = player.GetField("leftHandTransform");
     G.rightHand = player.GetField("rightHandTransform");
@@ -324,8 +320,6 @@ static bool Lookups() {
     G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
     G.usageGrip.set((Il2CppObject *)CreateMonoString("GripButton"));
     G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
-    G.usageStick.set((Il2CppObject *)CreateMonoString("Primary2DAxis"));
-    G.usageStickClick.set((Il2CppObject *)CreateMonoString("Primary2DAxisClick"));
     for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
         if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
     // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
@@ -400,20 +394,11 @@ static void SetText(Ref &text, const char *s) {
 
 // ---- input -------------------------------------------------------------------
 
-struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false,
-                 lclick = false, rclick = false; Vector2 lstick = Vector2(0, 0), rstick = Vector2(0, 0); };
+struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false; };
 static bool Pressed(int node, Ref &usage) {
     XRDevice d = G.deviceAtNode(node);
     bool v = false;
     if (d.initialized) G.tryGetBool(d.id, (BNM::Structures::Mono::String *)usage.get(), &v);
-    return v;
-}
-static Vector2 Stick(int node) {
-    Vector2 v(0, 0);
-    if (!G.tryGetVec2.IsValid()) return v;
-    XRDevice d = G.deviceAtNode(node);
-    if (d.initialized) G.tryGetVec2(d.id, (BNM::Structures::Mono::String *)G.usageStick.get(), &v);
-    if (v.x * v.x + v.y * v.y < 0.15f * 0.15f) v = Vector2(0, 0);   // dead zone
     return v;
 }
 static Buttons ReadButtons() {
@@ -423,8 +408,6 @@ static Buttons ReadButtons() {
     b.a = Pressed(right, G.usagePrimary); b.b = Pressed(right, G.usageSecondary);
     b.lgrip = Pressed(left, G.usageGrip); b.rgrip = Pressed(right, G.usageGrip);
     b.ltrig = Pressed(left, G.usageTrigger); b.rtrig = Pressed(right, G.usageTrigger);
-    b.lclick = Pressed(left, G.usageStickClick); b.rclick = Pressed(right, G.usageStickClick);
-    b.lstick = Stick(left); b.rstick = Stick(right);
     return b;
 }
 
@@ -432,7 +415,7 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
@@ -444,7 +427,7 @@ static int g_dupeArmed = 0;
 
 static constexpr int kDances = 18;                 // 0-7 Rig Mods dances, 8-17 Emotes
 static bool g_danceSel[kDances];
-static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
+static bool g_wxSel[4];             // Effects: Snow, Rain, Thunderstorm, Disco (pick one, like the dances)
 static int g_wx = -1;
 static bool g_todSel[4];            // Effects: Morning, Afternoon, Sunset, Night (pick one)
 static int g_tod = -1;
@@ -526,8 +509,6 @@ static Item g_items[] = {
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
     {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
-    {MOVEMENT, "Thumbstick Fly", TOGGLE, MAIN, &f_stickFly},
-    {MOVEMENT, "Dash", TOGGLE, MAIN, &f_dash},
 
 
     {EMOTES, "Exit Emotes", OPEN, MAIN},
@@ -572,6 +553,7 @@ static Item g_items[] = {
     {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
     {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
     {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
+    {EFFECTS, "Disco Party", TOGGLE, MAIN, &g_wxSel[3], WeatherPicked},
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
     {EFFECTS, "Morning", TOGGLE, MAIN, &g_todSel[0], TodPicked},
     {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
@@ -658,11 +640,12 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Weather and time of day. Only you see and hear them."},
+    {"Effects", "Weather, disco and time of day. Only you see and hear them."},
     {"Morning", "Low sun, soft warm light and a little mist."},
     {"Afternoon", "High sun and a bright blue sky."},
     {"Sunset", "An orange sky with the sun on the horizon."},
     {"Night", "Dark sky, moon and stars."},
+    {"Disco Party", "A spinning disco ball with colored beams, lights and sparkles."},
     {"Snow", "Snow falls around you."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
@@ -682,8 +665,6 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Floss", "Hold left trigger to floss."},
     {"Dab", "Hold left trigger to dab."},
     {"Bounce", "Bounce back up every time you land."},
-    {"Thumbstick Fly", "Left stick flies where you look, right stick goes up and down."},
-    {"Dash", "Click the right thumbstick to dash where you look."},
     {"Fling Gun", "Press A (X) to fling yourself where you point."},
     {"Turn Overpowered Off", "Switches every Overpowered mod off."},
     {"Change Pointer Position", "Moves the ball on your finger."},
@@ -1205,35 +1186,9 @@ static void FlyTick(const Buttons &in, float dt) {
     StopMoving();
 }
 
-// Thumbstick Fly: you hover, and the sticks move you (left: forward/back and sideways where
-// you look, right: up/down). Moves your body like Fly does, so the room sees you fly.
-static void StickFlyTick(const Buttons &in, float dt) {
-    Il2CppObject *head = g_head.get(), *t = PlayerTransform();
-    if (!f_stickFly || !head || !t) return;
-    float speed = f_fastFly ? 20.0f : 8.0f;
-    Vector3 move = G.trGetForward[head]() * in.lstick.y + G.trGetRight[head]() * in.lstick.x + Vector3(0, in.rstick.y, 0);
-    G.trSetPosition[t](G.trGetPosition[t]() + move * (speed * dt));
-    StopMoving();
-    Il2CppObject *player = g_player.get();
-    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
-}
-
-// Dash: one quick burst where you look on each right-thumbstick click.
-static bool g_dashPrev = false;
-static double g_nextDash = 0;
-static void DashTick(const Buttons &in) {
-    bool press = in.rclick && !g_dashPrev;
-    g_dashPrev = in.rclick;
-    Il2CppObject *head = g_head.get(), *player = g_player.get();
-    if (!f_dash || !press || !head || g_time < g_nextDash) return;
-    g_nextDash = g_time + 0.5;
-    SetVel(G.trGetForward[head]() * 16.0f);
-    if (player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.15f);
-}
-
 static void LowGravityTick(const Buttons &in, float dt) {
     Vector3 v;
-    if (!f_lowGravity || f_noGravity || f_stickFly || (f_fly && in.a) || !GetVel(v)) return;
+    if (!f_lowGravity || f_noGravity || (f_fly && in.a) || !GetVel(v)) return;
     SetVel(v + Vector3(0, 9.81f * 0.7f * dt, 0));       // cancels 70% of gravity
 }
 
@@ -2250,14 +2205,14 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
-// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
+// ---- effects: snow, rain, thunderstorm, disco (only you see and hear them) -----------
 // Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
 // head and is reused: a piece that lands, or drifts too far away, restarts above you. The
 // pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
 // the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
 // dim flash of light, and a thunder rumble that is made from noise in code, once.
 static constexpr int kMaxFx = 100;
-static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
+static const int kFxCounts[4][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}, {30, 55, 80}};   // [effect][intensity]
 static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
 static int g_wxIntensity = 1;
 static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
@@ -2271,8 +2226,8 @@ static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
 
 static void WeatherPicked() {
     int picked = -1;
-    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
-    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
+    for (int i = 0; i < 4; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 4; i++) g_wxSel[i] = (i == picked);
     g_wx = picked;
 }
 static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
@@ -2295,6 +2250,7 @@ static void StyleFx(int i, int mode) {
     Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
     if (!Alive(o) || !t) return;
     if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
+    else if (mode == 3) { SetColor(o, Rainbow(i / 17.0f)); G.trSetLocalScale[t](Vector3(0.025f, 0.025f, 0.025f)); }
     else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
 }
 
@@ -2418,12 +2374,122 @@ static void StormTick(Vector3 hp) {
     if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
 }
 
-// Light setters, looked up once (used by the thunderstorm flash and the time of day).
+// ---- disco ------------------------------------------------------------------------
+// A silver ball above your head with colored mirror tiles, spinning; six colored beams
+// sweeping down from it; three colored lights circling you, pulsing to a 120 BPM beat;
+// and the effect pool used as floating rainbow sparkles. Everything is made once, parented
+// to the weather root (so it hides and is destroyed with the other effects), and only
+// moved and recolored after that.
+static constexpr int kDiscoFacets = 14, kDiscoBeams = 6, kDiscoLights = 3;
+static Ref g_discoBall, g_discoFacet[kDiscoFacets], g_discoBeam[kDiscoBeams], g_discoLight[kDiscoLights];
+static bool g_discoShown = false;
+
+static void HideDisco() {
+    if (!g_discoShown) return;
+    g_discoShown = false;
+    Show(g_discoBall, false);
+    for (auto &b : g_discoBeam) Show(b, false);
+    for (auto &l : g_discoLight) if (Alive(l.get())) G.behaviourSetEnabled[l.get()](false);
+}
+static void DiscoClear() {                                     // the objects died with the weather root
+    g_discoBall.clear();
+    for (auto &f : g_discoFacet) f.clear();
+    for (auto &b : g_discoBeam) b.clear();
+    for (auto &l : g_discoLight) l.clear();
+    g_discoShown = false;
+}
 static void LightMethods(Class &light) {
     if (!g_lightType.IsValid()) g_lightType = light.GetMethod("set_type", 1);
     if (!g_lightIntensity.IsValid()) g_lightIntensity = light.GetMethod("set_intensity", 1);
     if (!g_lightRange.IsValid()) g_lightRange = light.GetMethod("set_range", 1);
     if (!g_lightColor.IsValid()) g_lightColor = light.GetMethod("set_color", 1);
+}
+static void EnsureDisco() {
+    if (!EnsureWxRoot()) return;
+    Il2CppObject *root = Tr(g_wxRoot.get());
+    if (!Alive(g_discoBall.get())) {
+        Il2CppObject *ball = Prim(0, Color(0.78f, 0.80f, 0.86f, 1), false);
+        if (!ball) return;
+        Il2CppObject *bt = Tr(ball);
+        G.trSetParent[bt](root, false);
+        G.trSetLocalScale[bt](Vector3(0.5f, 0.5f, 0.5f));
+        g_discoBall.set(ball);
+        for (int i = 0; i < kDiscoFacets; i++) {               // tiles spread over the ball (a golden-angle spiral)
+            float y = 1 - 2 * (i + 0.5f) / kDiscoFacets, r = sqrtf(1 - y * y), a = i * 2.39996f;
+            Vector3 d(cosf(a) * r, y, sinf(a) * r);
+            Il2CppObject *f = Cube(Rainbow(i / (float)kDiscoFacets), false);
+            if (!f) continue;
+            Il2CppObject *ft = Tr(f);
+            G.trSetParent[ft](bt, false);
+            G.trSetLocalPosition[ft](d * 0.5f);
+            G.trSetLocalRotation[ft](Quaternion::LookRotation(d));
+            G.trSetLocalScale[ft](Vector3(0.2f, 0.2f, 0.04f));
+            g_discoFacet[i].set(f);
+        }
+    }
+    for (int i = 0; i < kDiscoBeams; i++) {
+        if (Alive(g_discoBeam[i].get())) continue;
+        Il2CppObject *b = Cube(Rainbow(i / (float)kDiscoBeams), false);
+        if (!b) continue;
+        G.trSetParent[Tr(b)](root, false);
+        g_discoBeam[i].set(b);
+    }
+    Class light("UnityEngine", "Light");
+    if (!light.IsValid()) return;
+    LightMethods(light);
+    for (int i = 0; i < kDiscoLights; i++) {
+        if (Alive(g_discoLight[i].get())) continue;
+        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellDiscoLight"));
+        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+        if (!l) continue;
+        G.trSetParent[Tr(go)](root, false);
+        if (g_lightType.IsValid()) g_lightType[l](2);              // point light
+        if (g_lightRange.IsValid()) g_lightRange[l](9.0f);
+        g_discoLight[i].set(l);
+    }
+}
+static void DiscoTick(Vector3 hp, int intensity) {
+    EnsureDisco();
+    float t = (float)g_time;
+    float beat = 1.0f - (t * 2.0f - floorf(t * 2.0f));             // 120 BPM: jumps to 1 on each beat, then fades
+    beat = 0.55f + 0.45f * beat * beat;
+    if (!g_discoShown) {
+        g_discoShown = true;
+        Show(g_discoBall, true);
+        for (auto &b : g_discoBeam) Show(b, true);
+    }
+    Vector3 ball = hp + Vector3(0, 2.2f, 0);
+    Il2CppObject *bo = g_discoBall.get();
+    if (Alive(bo)) {
+        Il2CppObject *bt = Tr(bo);
+        float spin = t * 1.2f;
+        G.trSetPosition[bt](ball);
+        G.trSetRotation[bt](Quaternion(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f)));
+    }
+    if (g_frames % 3 == 0)                                          // tiles twinkle through the colors
+        for (int i = 0; i < kDiscoFacets; i++) SetColor(g_discoFacet[i].get(), Rainbow(t * 0.5f + i * 0.37f));
+    const float len = 6.0f, tilt = 0.9f;                            // beams: about 50 degrees down from straight up
+    for (int i = 0; i < kDiscoBeams; i++) {
+        Il2CppObject *b = g_discoBeam[i].get();
+        if (!Alive(b)) continue;
+        float a = t * 0.8f + i * 6.2831853f / kDiscoBeams, wob = tilt + 0.25f * sinf(t * 1.3f + i);
+        Vector3 d(cosf(a) * sinf(wob), -cosf(wob), sinf(a) * sinf(wob));
+        Il2CppObject *bt = Tr(b);
+        G.trSetPosition[bt](ball + d * (len * 0.5f + 0.25f));
+        G.trSetRotation[bt](Quaternion::LookRotation(d));
+        G.trSetLocalScale[bt](Vector3(0.03f, 0.03f, len));
+        if (g_frames % 3 == 1) SetColor(b, Rainbow(t * 0.3f + i / (float)kDiscoBeams));
+    }
+    const float strength[] = {1.5f, 2.5f, 3.5f};
+    for (int i = 0; i < kDiscoLights; i++) {
+        Il2CppObject *l = g_discoLight[i].get();
+        if (!Alive(l)) continue;
+        G.behaviourSetEnabled[l](true);
+        float a = t * 1.1f + i * 6.2831853f / kDiscoLights;
+        G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(cosf(a) * 2.0f, 1.0f, sinf(a) * 2.0f));
+        if (g_lightColor.IsValid()) g_lightColor[l](Rainbow(t * 0.25f + i / (float)kDiscoLights));
+        if (g_lightIntensity.IsValid()) g_lightIntensity[l](strength[intensity] * beat);
+    }
 }
 
 static void WeatherOff() {
@@ -2437,6 +2503,7 @@ static void WeatherOff() {
     if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
     if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
     HideBolt();
+    HideDisco();
 }
 static void WeatherReset() {                                   // room change: the old objects are gone
     Kill(g_wxRoot);
@@ -2444,6 +2511,7 @@ static void WeatherReset() {                                   // room change: t
     Kill(g_wxClip);
     for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
     for (int i = 0; i < 7; i++) g_bolt[i].clear();
+    DiscoClear();
     g_wxLight.clear();
     g_wxAudioSrc.clear();
     g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
@@ -2497,16 +2565,24 @@ static void WeatherTick(float dt) {
             p.y -= 1.1f * dt;
             p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
             p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
+        } else if (mode == 3) {                                // disco: sparkles float and circle around you
+            float dx = p.x - hp.x, dz = p.z - hp.z;
+            p.x += -dz * 0.25f * dt;
+            p.z += dx * 0.25f * dt;
+            p.y += sinf(t * 2.0f + g_fxPhase[i]) * 0.25f * dt;
+            if ((g_frames + i) % 4 == 0) SetColor(g_fx[i].get(), Rainbow(t * 0.4f + g_fxPhase[i]));
         } else {                                               // rain: fast, a little wind
             p.y -= 9.0f * dt;
             p.x += 0.6f * dt;
         }
         float dx = p.x - hp.x, dz = p.z - hp.z;
-        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, mode == 3);
         if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
     }
     if (mode == 2) StormTick(hp);
     else { HideBolt(); g_nextBolt = 0; }
+    if (mode == 3) DiscoTick(hp, intensity);
+    else HideDisco();
 }
 
 // ---- time of day: morning, afternoon, sunset, night ------------------------------------
@@ -3248,8 +3324,6 @@ static void OnUpdate(float dt) {
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
-    StickFlyTick(in, dt);
-    DashTick(in);
     LowGravityTick(in, dt);
     PlatformFor(in.lgrip, g_leftPlatform, g_leftHand);
     PlatformFor(in.rgrip, g_rightPlatform, g_rightHand);
