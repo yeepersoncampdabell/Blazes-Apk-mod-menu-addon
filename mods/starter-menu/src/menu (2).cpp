@@ -1,0 +1,2632 @@
+// ClientDaBell: a hand menu built from the starter menu (ii's Stupid Menu layout).
+// The layout idea comes from ii's menu; the code is new.
+//   Hold Y (left hand)      -> menu on your left hand, tipped like ii's; turn your palm to you
+//                              (B and the right hand with "Right Hand Menu")
+//   Touch a button with your other index finger to press it
+//   < and > on the sides    -> previous / next page
+//   Pages: Movement Mods, Rig Mods, Items, Settings, Enabled Mods
+// Movement only changes your own game. Rig mods (dances) and Items are seen by the room,
+// within the limits in AGENTS.md ("Things others see"). Read docs/GUIDE.md before adding.
+#include "ymsdk.hpp"
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <dirent.h>
+#include <strings.h>
+#include <ctime>
+#include <string>
+#include <vector>
+
+using namespace BNM;
+using namespace BNM::Structures::Unity;
+using BNM::IL2CPP::Il2CppObject;
+
+YEEPS_MOD("ClientDaBell")
+#define CDB_VERSION "v1.2.2"
+
+// ---- small helpers ---------------------------------------------------------
+
+static std::string TypeName(const BNM::IL2CPP::Il2CppType *t) {
+    Class c(t);
+    if (!c.IsValid() || !c.GetClass() || !c.GetClass()->name) return "?";
+    auto *k = c.GetClass();
+    return (k->namespaze && k->namespaze[0]) ? std::string(k->namespaze) + "." + k->name : k->name;
+}
+// Pick an overload by its exact parameter types, e.g. GetComponent(System.Type).
+static MethodBase Overload(Class c, const char *name, std::vector<std::string> types) {
+    for (auto &m : c.GetMethods(false)) {
+        auto *mi = m.GetInfo();
+        if (!mi || !mi->name || strcmp(mi->name, name) != 0 || mi->parameters_count != types.size()) continue;
+        bool ok = true;
+        for (size_t i = 0; i < types.size() && ok; i++) ok = TypeName(mi->parameters[i]) == types[i];
+        if (ok) return m;
+    }
+    return {};
+}
+
+// Unity objects we keep between frames must be held by a GC handle, or the
+// garbage collector can free them under us.
+static void *(*p_handleNew)(void *, bool);
+static void *(*p_handleTarget)(void *);
+static void (*p_handleFree)(void *);
+struct Ref {
+    void *h = nullptr;
+    void set(Il2CppObject *o) { clear(); if (o && p_handleNew) h = p_handleNew(o, false); }
+    Il2CppObject *get() const { return h && p_handleTarget ? (Il2CppObject *)p_handleTarget(h) : nullptr; }
+    void clear() { if (h && p_handleFree) p_handleFree(h); h = nullptr; }
+};
+
+static Color Lerp(Color a, Color b, float t) {
+    return Color(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1);
+}
+static Color Rainbow(float h) {             // hue 0..1 -> bright color
+    h = h - floorf(h);
+    float r = fabsf(h * 6 - 3) - 1, g = 2 - fabsf(h * 6 - 2), b = 2 - fabsf(h * 6 - 4);
+    auto c = [](float v) { return v < 0 ? 0.f : v > 1 ? 1.f : v; };
+    return Color(c(r), c(g), c(b), 1);
+}
+
+// ---- game lookups, resolved once -------------------------------------------
+
+struct XRDevice { uint64_t id; bool initialized; };
+static bool g_customFont = false;       // Londrina Solid loaded from the fonts folder
+static struct {
+    bool ok = false;
+    Method<Il2CppObject *> createPrimitive, goTransform, goGetComponent, goAddComponent, compTransform, compGameObject;
+    Method<void> goSetActive, destroy, trSetParent, trSetPosition, trSetRotation, trSetLocalPosition,
+                 trSetLocalRotation, trSetLocalScale, rbSetVelocity, matSetColor, matSetShader,
+                 textSetFont, textSetText, textSetFontSize, textSetAlignment, graphicSetColor,
+                 canvasSetRenderMode, rtSetSizeDelta, textSetFontStyle, textSetBestFit, textSetMinSize,
+                 textSetMaxSize, teleportTo, rbAddForce, rbSetUseGravity, colliderSetEnabled,
+                 lrSetPositionCount, lrSetPosition, lrSetStartWidth, lrSetEndWidth, lrSetUseWorldSpace;
+    Method<Quaternion> trGetRotation;
+    Method<Vector3> trGetPosition, trGetForward, trGetRight, trGetUp, trInverseTransformPoint, trTransformPoint, rbGetVelocity;
+    Method<bool> alive, tryGetBool, haptic, raycast;
+    Method<XRDevice> deviceAtNode;
+    Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
+    Method<void> pvRpc;
+    Method<Il2CppObject *> audioClipCreate;           // soundboard
+    Method<bool> audioClipSetData;
+    Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    BNM::MonoType *tAudioSource = nullptr;
+    BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
+    BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
+    BNM::IL2CPP::Il2CppClass *objectClass = nullptr, *stringClass = nullptr;
+    BNM::MonoType *tPhotonView = nullptr, *tItem = nullptr;
+    Method<BNM::Structures::Mono::String *> itemKey, itemId;
+    Method<bool> itemHeld;
+    Method<void> itemDrop, setHeldItem;
+    void *(*arrayNew)(void *, uintptr_t) = nullptr;
+    void *(*valueBox)(void *, void *) = nullptr;
+    Method<bool> behaviourGetEnabled;
+    Method<void> behaviourSetEnabled;
+    std::vector<BNM::MonoType *> trackerTypes;
+    Method<Il2CppObject *> rendererGetMaterial, shaderFind, findAll, findScene, findSceneByType, builtinResource;
+    Field<Il2CppObject *> leftHand, rightHand, headTransform, bodyCollider, headCollider;
+    Field<float> maxJumpSpeed, jumpMultiplier;
+    Method<Vector3> plGetVelocity;
+    Method<void> plSetVelocity, plNoGravityFor;
+    Field<int> locomotionLayers, collisionLayers;
+    Method<int> goGetLayer;
+    Method<bool> colliderIsTrigger, behaviourGetEnabledCollider;
+    Method<void> ignoreLayers;            // a LayerMask: which layers your hands can climb on
+    Method<void> goSetLayer;
+    BNM::MonoType *tRigidbody = nullptr, *tCollider = nullptr, *tCanvas = nullptr, *tText = nullptr,
+                  *tFont = nullptr, *tRenderer = nullptr, *tMeshCollider = nullptr, *tLine = nullptr;
+    Ref shader, font, usagePrimary, usageSecondary, usageGrip, usageTrigger;
+} G;
+
+static bool Lookups() {
+    if (G.ok) return true;
+    auto R = ym::api()->resolve;
+    p_handleNew = (decltype(p_handleNew))R("il2cpp_gchandle_new");
+    p_handleTarget = (decltype(p_handleTarget))R("il2cpp_gchandle_get_target");
+    p_handleFree = (decltype(p_handleFree))R("il2cpp_gchandle_free");
+    Class go("UnityEngine", "GameObject"), tr("UnityEngine", "Transform"), obj("UnityEngine", "Object"),
+          rb("UnityEngine", "Rigidbody"), mat("UnityEngine", "Material"), rend("UnityEngine", "Renderer"),
+          sh("UnityEngine", "Shader"), res("UnityEngine", "Resources"), text("UnityEngine.UI", "Text"),
+          graphic("UnityEngine.UI", "Graphic"), canvas("UnityEngine", "Canvas"), rt("UnityEngine", "RectTransform"),
+          dev("UnityEngine.XR", "InputDevices"), player("", "MasterPlayer", Image("Assembly-CSharp.dll"));
+    if (!go || !tr || !player || !dev) { ym::log("clientdabell: game classes missing"); return false; }
+    G.createPrimitive = go.GetMethod("CreatePrimitive", 1);
+    G.goTransform = go.GetMethod("get_transform", 0);
+    G.goGetComponent = Overload(go, "GetComponent", {"System.Type"});
+    G.goAddComponent = Overload(go, "AddComponent", {"System.Type"});
+    G.goSetActive = go.GetMethod("SetActive", 1);
+    Class comp("UnityEngine", "Component");
+    G.compTransform = comp.GetMethod("get_transform", 0);
+    G.compGameObject = comp.GetMethod("get_gameObject", 0);
+    G.destroy = Overload(obj, "Destroy", {"UnityEngine.Object"});
+    G.alive = obj.GetMethod("op_Implicit", 1);
+    {
+        Class aclip("UnityEngine", "AudioClip"), asrc("UnityEngine", "AudioSource"), flt("System", "Single");
+        if (flt.IsValid()) G.floatClass = flt.GetClass();
+        if (aclip.IsValid()) {
+            G.audioClipCreate = Overload(aclip, "Create", {"System.String", "System.Int32", "System.Int32", "System.Int32", "System.Boolean"});
+            G.audioClipSetData = aclip.GetMethod("SetData", 2);
+        }
+        if (asrc.IsValid()) {
+            G.tAudioSource = asrc.GetMonoType();
+            G.asSetClip = asrc.GetMethod("set_clip", 1);
+            G.asSetVolume = asrc.GetMethod("set_volume", 1);
+            G.asSetSpatial = asrc.GetMethod("set_spatialBlend", 1);
+            G.asSetLoop = asrc.GetMethod("set_loop", 1);
+            G.asPlay = asrc.GetMethod("Play", 0);
+            G.asStop = asrc.GetMethod("Stop", 0);
+        }
+    }
+    G.trSetParent = Overload(tr, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
+    G.trSetPosition = tr.GetMethod("set_position", 1);
+    G.trSetRotation = tr.GetMethod("set_rotation", 1);
+    G.trSetLocalPosition = tr.GetMethod("set_localPosition", 1);
+    G.trSetLocalRotation = tr.GetMethod("set_localRotation", 1);
+    G.trSetLocalScale = tr.GetMethod("set_localScale", 1);
+    G.trGetPosition = tr.GetMethod("get_position", 0);
+    G.trGetRotation = tr.GetMethod("get_rotation", 0);
+    G.trGetForward = tr.GetMethod("get_forward", 0);
+    G.trGetRight = tr.GetMethod("get_right", 0);
+    G.trGetUp = tr.GetMethod("get_up", 0);
+    G.trInverseTransformPoint = Overload(tr, "InverseTransformPoint", {"UnityEngine.Vector3"});
+    G.trTransformPoint = Overload(tr, "TransformPoint", {"UnityEngine.Vector3"});
+    G.rbSetVelocity = rb.GetMethod("set_velocity", 1);
+    G.rbGetVelocity = rb.GetMethod("get_velocity", 0);
+    G.rendererGetMaterial = rend.GetMethod("get_material", 0);
+    G.matSetColor = Overload(mat, "set_color", {"UnityEngine.Color"});
+    G.matSetShader = mat.GetMethod("set_shader", 1);
+    G.shaderFind = sh.GetMethod("Find", 1);
+    G.findAll = Overload(res, "FindObjectsOfTypeAll", {"System.Type"});
+    G.textSetFont = text.GetMethod("set_font", 1);
+    G.textSetFontStyle = text.GetMethod("set_fontStyle", 1);
+    G.textSetBestFit = text.GetMethod("set_resizeTextForBestFit", 1);
+    G.textSetMinSize = text.GetMethod("set_resizeTextMinSize", 1);
+    G.textSetMaxSize = text.GetMethod("set_resizeTextMaxSize", 1);
+    G.textSetText = text.GetMethod("set_text", 1);
+    G.textSetFontSize = text.GetMethod("set_fontSize", 1);
+    G.textSetAlignment = text.GetMethod("set_alignment", 1);
+    G.graphicSetColor = graphic.GetMethod("set_color", 1);
+    G.canvasSetRenderMode = canvas.GetMethod("set_renderMode", 1);
+    G.rtSetSizeDelta = rt.GetMethod("set_sizeDelta", 1);
+    G.deviceAtNode = dev.GetMethod("GetDeviceAtXRNode", 1);
+    G.tryGetBool = dev.GetMethod("TryGetFeatureValue_bool", 3);
+    G.haptic = dev.GetMethod("SendHapticImpulse", 4);    // optional: a small buzz on press
+    G.leftHand = player.GetField("leftHandTransform");
+    G.rightHand = player.GetField("rightHandTransform");
+    G.headTransform = player.GetField("headTransform");
+    G.bodyCollider = player.GetField("bodyCollider");
+    G.headCollider = player.GetField("headCollider");
+    G.maxJumpSpeed = player.GetField("maxJumpSpeed");
+    G.locomotionLayers = player.GetField("locomotionEnabledLayers");
+    G.collisionLayers = player.GetField("collisionEnabledLayers");
+    G.goGetLayer = go.GetMethod("get_layer", 0);
+    G.ignoreLayers = Class("UnityEngine", "Physics").GetMethod("IgnoreLayerCollision", 3);
+    // Yeeps moves your body through these, not through a Rigidbody on the player object
+    G.plGetVelocity = player.GetMethod("GetVelocity", 0);
+    G.plSetVelocity = player.GetMethod("ApplySetVelocityNoHaptic", 1);
+    if (!G.plSetVelocity.IsValid()) G.plSetVelocity = player.GetMethod("ApplySetVelocity", 1);
+    G.plNoGravityFor = player.GetMethod("ApplyNoGravityDuration", 1);
+    ym::log("clientdabell: velocity %d/%d, no-gravity %d", G.plGetVelocity.IsValid(), G.plSetVelocity.IsValid(),
+            G.plNoGravityFor.IsValid());
+    G.goSetLayer = go.GetMethod("set_layer", 1);
+    G.jumpMultiplier = player.GetField("jumpMultiplier");
+    G.teleportTo = player.GetMethod("TeleportTo", 1);
+    G.rbAddForce = Overload(rb, "AddForce", {"UnityEngine.Vector3", "UnityEngine.ForceMode"});
+    G.rbSetUseGravity = rb.GetMethod("set_useGravity", 1);
+    G.colliderSetEnabled = Class("UnityEngine", "Collider").GetMethod("set_enabled", 1);
+    G.behaviourGetEnabledCollider = Class("UnityEngine", "Collider").GetMethod("get_enabled", 0);
+    G.colliderIsTrigger = Class("UnityEngine", "Collider").GetMethod("get_isTrigger", 0);
+    G.raycast = Overload(Class("UnityEngine", "Physics"), "Raycast",
+                         {"UnityEngine.Vector3", "UnityEngine.Vector3", "UnityEngine.RaycastHit", "System.Single", "System.Int32"});
+    G.findScene = Overload(obj, "FindObjectsOfType", {"System.Type"});      // only when noclip starts
+    G.findSceneByType = Overload(obj, "FindObjectsByType", {"System.Type", "UnityEngine.FindObjectsSortMode"});
+    G.builtinResource = Overload(res, "GetBuiltinResource", {"System.Type", "System.String"});
+    Class line("UnityEngine", "LineRenderer");
+    G.tLine = line.GetMonoType();
+    G.lrSetPositionCount = line.GetMethod("set_positionCount", 1);
+    G.lrSetPosition = line.GetMethod("SetPosition", 2);
+    G.lrSetStartWidth = line.GetMethod("set_startWidth", 1);
+    G.lrSetEndWidth = line.GetMethod("set_endWidth", 1);
+    G.lrSetUseWorldSpace = line.GetMethod("set_useWorldSpace", 1);
+    G.tMeshCollider = Class("UnityEngine", "MeshCollider").GetMonoType();
+    G.trGetParent = tr.GetMethod("get_parent", 0);
+    G.trGetRoot = tr.GetMethod("get_root", 0);
+    G.getComponentsInChildren = Overload(go, "GetComponentsInChildren", {"System.Type", "System.Boolean"});
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    if (net.IsValid()) {
+        G.netLocal = net.GetMethod("get_local", 0);
+        for (auto &m : net.GetMethods(false))
+            if (m.GetInfo() && m.GetInfo()->name && strcmp(m.GetInfo()->name, "RpcCreateItem") == 0) G.rpcCreateItem = m.GetInfo();
+    }
+    {
+        Class pv("Photon.Pun", "PhotonView");
+        G.tPhotonView = pv.IsValid() ? pv.GetMonoType() : nullptr;
+        if (pv.IsValid()) G.pvRpc = Overload(pv, "RPC", {"System.String", "Photon.Pun.RpcTarget", "System.Object[]"});
+        Class item("", "Item", Image("Assembly-CSharp.dll"));
+        if (item.IsValid()) {
+            G.tItem = item.GetMonoType();
+            G.itemKey = item.GetMethod("get_itemKey", 0);
+            G.itemHeld = item.GetMethod("IsHeldOrAnchoredToAnyPlayer", 0);
+            G.itemId = item.GetMethod("get_itemID", 0);
+            G.itemDrop = item.GetMethod("TrySendDrop", 0);
+            G.setHeldItem = Class("", "MasterPlayer", Image("Assembly-CSharp.dll")).GetMethod("SetHeldItem", 2);
+        }
+        G.objectClass = Class("System", "Object").GetClass();
+        G.stringClass = Class("System", "String").GetClass();
+        G.arrayNew = (decltype(G.arrayNew))ym::api()->resolve("il2cpp_array_new");
+        G.valueBox = (decltype(G.valueBox))ym::api()->resolve("il2cpp_value_box");
+        ym::log("clientdabell: items rpc=%d pv=%d item=%d box=%d", G.rpcCreateItem != nullptr, G.pvRpc.IsValid(),
+                G.itemKey.IsValid(), G.arrayNew && G.valueBox);
+    }
+    Class behaviour("UnityEngine", "Behaviour");
+    G.behaviourGetEnabled = behaviour.GetMethod("get_enabled", 0);
+    G.behaviourSetEnabled = behaviour.GetMethod("set_enabled", 1);
+    // What moves your hands with the controllers (paused while you dance)
+    for (auto nc : std::vector<std::pair<const char *, const char *>>{
+             {"UnityEngine.XR.Interaction.Toolkit", "XRBaseController"},
+             {"UnityEngine.InputSystem.XR", "TrackedPoseDriver"},
+             {"UnityEngine.SpatialTracking", "TrackedPoseDriver"}}) {
+        Class c(nc.first, nc.second);
+        if (c.IsValid()) G.trackerTypes.push_back(c.GetMonoType());
+    }
+    G.tRigidbody = rb.GetMonoType();
+    G.tCollider = Class("UnityEngine", "Collider").GetMonoType();
+    G.tRenderer = rend.GetMonoType();
+    G.tCanvas = canvas.GetMonoType();
+    G.tText = text.GetMonoType();
+    G.tFont = Class("UnityEngine", "Font").GetMonoType();
+    G.usagePrimary.set((Il2CppObject *)CreateMonoString("PrimaryButton"));
+    G.usageSecondary.set((Il2CppObject *)CreateMonoString("SecondaryButton"));
+    G.usageGrip.set((Il2CppObject *)CreateMonoString("GripButton"));
+    G.usageTrigger.set((Il2CppObject *)CreateMonoString("TriggerButton"));
+    for (const char *s : {"Universal Render Pipeline/Unlit", "Universal Render Pipeline/Lit"})
+        if (!G.shader.get() && G.shaderFind.IsValid()) G.shader.set(G.shaderFind((BNM::Structures::Mono::String *)CreateMonoString(s)));
+    // Londrina Solid: copy LondrinaSolid-Regular.ttf into a "fonts" folder next to the .so
+    // files (mods/fonts/). If it is missing or won't load, the game's own font is used.
+    {
+        std::string fpath = std::string(ym::api()->modsDir ? ym::api()->modsDir : "") + "/fonts/LondrinaSolid-Regular.ttf";
+        FILE *ff = fopen(fpath.c_str(), "rb");
+        if (ff) {
+            fclose(ff);
+            try {
+                Class fc("UnityEngine", "Font");
+                Il2CppObject *fo = fc.IsValid() ? fc.CreateNewObjectParameters(CreateMonoString(fpath.c_str())) : nullptr;
+                bool good = fo && G.alive((Il2CppObject *)fo);
+                ym::log("clientdabell: font ctor(path): object=%d alive=%d", fo ? 1 : 0, good ? 1 : 0);
+                if (!good && fc.IsValid()) {                       // second route: empty Font, then load the file into it
+                    Il2CppObject *f2 = fc.CreateNewObjectParameters();
+                    Method<void> load = fc.GetMethod("Internal_CreateFontFromPath", 2);
+                    if (f2 && load.IsValid()) {
+                        load(f2, (BNM::Structures::Mono::String *)CreateMonoString(fpath.c_str()));
+                        fo = f2;
+                        good = G.alive((Il2CppObject *)fo);
+                    }
+                    ym::log("clientdabell: font second route: object=%d loader=%d alive=%d", f2 ? 1 : 0, load.IsValid() ? 1 : 0, good ? 1 : 0);
+                }
+                MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
+                if (good && hasChar.IsValid()) {
+                    Method<bool> hc = hasChar;
+                    bool hasA = hc[fo]((uint16_t)'A');
+                    ym::log("clientdabell: Londrina Solid object created, HasCharacter(A)=%d", (int)hasA);   // not used as a gate: it can read false before first use
+                }
+                if (good) { G.font.set(fo); g_customFont = true; }
+                ym::log("clientdabell: Londrina Solid font %s", good ? "loaded" : "failed, using the game's font");
+            } catch (...) { ym::log("clientdabell: Londrina Solid font error, using the game's font"); }
+        } else ym::log("clientdabell: no font file at %s, using the game's font", fpath.c_str());
+    }
+    // Arial, like ii's menu (Unity 6 calls it LegacyRuntime.ttf)
+    for (const char *f : {"LegacyRuntime.ttf", "Arial.ttf"})
+        if (!G.font.get() && G.builtinResource.IsValid() && G.tFont)
+            G.font.set(G.builtinResource((Il2CppObject *)G.tFont, CreateMonoString(f)));
+    if (!G.font.get() && G.findAll.IsValid() && G.tFont) {   // else any font the game loaded (one time)
+        auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tFont);
+        if (arr && *(uintptr_t *)(arr + 0x18) > 0) G.font.set(((Il2CppObject **)(arr + 0x20))[0]);
+    }
+    G.ok = G.createPrimitive.IsValid() && G.goTransform.IsValid() && G.trSetPosition.IsValid() &&
+           G.deviceAtNode.IsValid() && G.tryGetBool.IsValid() && G.leftHand.IsValid();
+    if (!G.ok) ym::log("clientdabell: some game methods are missing, menu off");
+    return G.ok;
+}
+
+static bool Alive(Il2CppObject *o) { return o && G.alive((Il2CppObject *)o); }
+static Il2CppObject *Tr(Il2CppObject *gameObject) { return G.goTransform[gameObject](); }
+static void Show(Ref &r, bool on) { if (Alive(r.get())) G.goSetActive[r.get()](on); }
+static void Kill(Ref &r) { if (Alive(r.get())) G.destroy(r.get()); r.clear(); }
+
+// A primitive with a flat color. collider=false removes its collider so it can't push you.
+// Always give new objects the URP shader: Unity's default material only draws in one
+// eye on Quest.
+static Il2CppObject *Prim(int type, Color c, bool collider) {
+    Il2CppObject *o = G.createPrimitive(type);   // 0 = Sphere, 3 = Cube
+    if (!o) return nullptr;
+    if (!collider) if (auto *col = G.goGetComponent[o](G.tCollider)) G.destroy(col);
+    if (auto *r = G.goGetComponent[o](G.tRenderer)) {
+        Il2CppObject *m = G.rendererGetMaterial[r]();
+        if (m && G.shader.get()) G.matSetShader[m](G.shader.get());
+        if (m) G.matSetColor[m](c);
+    }
+    return o;
+}
+static Il2CppObject *Cube(Color c, bool collider) { return Prim(3, c, collider); }
+static void SetColor(Il2CppObject *o, Color c) {
+    if (!Alive(o)) return;
+    if (auto *r = G.goGetComponent[o](G.tRenderer)) if (Il2CppObject *m = G.rendererGetMaterial[r]()) G.matSetColor[m](c);
+}
+static void SetText(Ref &text, const char *s) {
+    if (Alive(text.get())) G.textSetText[text.get()](CreateMonoString(s));
+}
+
+// ---- input -------------------------------------------------------------------
+
+struct Buttons { bool a = false, b = false, x = false, y = false, lgrip = false, rgrip = false, ltrig = false, rtrig = false; };
+static bool Pressed(int node, Ref &usage) {
+    XRDevice d = G.deviceAtNode(node);
+    bool v = false;
+    if (d.initialized) G.tryGetBool(d.id, (BNM::Structures::Mono::String *)usage.get(), &v);
+    return v;
+}
+static Buttons ReadButtons() {
+    const int left = 4, right = 5;              // XRNode.LeftHand / RightHand
+    Buttons b;
+    b.x = Pressed(left, G.usagePrimary);  b.y = Pressed(left, G.usageSecondary);
+    b.a = Pressed(right, G.usagePrimary); b.b = Pressed(right, G.usageSecondary);
+    b.lgrip = Pressed(left, G.usageGrip); b.rgrip = Pressed(right, G.usageGrip);
+    b.ltrig = Pressed(left, G.usageTrigger); b.rtrig = Pressed(right, G.usageTrigger);
+    return b;
+}
+
+// ---- menu contents -------------------------------------------------------------
+
+// Feature switches. Every feature only changes your own game.
+static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_bigHands, f_flingGun, f_propGun, f_bounce;   // Overpowered
+static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
+static char g_itemKey[64] = "";                // the last item you held (learned on grab)
+struct PendingItem { Vector3 pos, vel; };
+static std::vector<PendingItem> g_itemQueue;
+static double g_nextItem = 0, g_nextBatch = 0;
+static int g_dupeArmed = 0;
+
+static constexpr int kDances = 8;
+static bool g_danceSel[kDances];
+static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
+static int g_wx = -1;
+static int g_dance = -1;            // the picked dance, -1 = none
+static bool f_fly, f_fastFly, f_platforms, f_lowGravity, f_rainbow, f_fps, f_clock, f_rightHand,
+            f_notify = true;
+static Ref g_player, g_rigidbody, g_leftHand, g_rightHand, g_head;
+static Vector3 g_spot;
+static bool g_haveSpot = false;
+
+static void Notify(const char *fmt, ...);
+static void SaveSpot();
+static void GoToSpot();
+static void NextTheme();
+static void AllOff();
+static void PointerToHand();
+static void NextPointer();
+static void NextIronSpeed();
+static void NextCarSpeed();
+static void ApplySpeedBoost();
+static void ApplyGravity();
+static void DancePicked();
+static void ArmDupe9();
+static void ArmDupe27();
+static void ArmDupe9x3();
+static bool LeftHandItem();
+static void ScanSongs();
+static void PlaySong();
+static void NextSong();
+static void PrevSong();
+static void StopSound();
+static void ApplyLoop();
+static void NextSoundVolume();
+static void WeatherPicked();
+static void LongArmsToggled();
+static void NextArmLength();
+static void NextJumpPower();
+static void ApplyBigHands();
+static void OverpoweredOff();
+static void NextWeatherIntensity();
+
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods"};
+enum Kind { OPEN, TOGGLE, ACTION };
+struct Item {
+    Cat cat;
+    const char *label;
+    Kind kind;
+    Cat target = MAIN;            // OPEN: the page it opens
+    bool *flag = nullptr;         // TOGGLE: the switch
+    void (*fn)() = nullptr;       // ACTION, or called after a TOGGLE changes
+};
+// The owner's layout (2026-10-31). Keep this order.
+static Item g_items[] = {
+    {MAIN, "Settings", OPEN, SETTINGS},
+    {MAIN, "Movement Mods", OPEN, MOVEMENT},
+    {MAIN, "Rig Mods", OPEN, RIG},
+    {MAIN, "Items", OPEN, ITEMS},
+    {MAIN, "Soundboard", OPEN, SOUNDBOARD},
+    {MAIN, "Effects", OPEN, EFFECTS},
+    {MAIN, "Overpowered", OPEN, OVERPOWERED},
+    {MAIN, "Enabled Mods", OPEN, ENABLED},
+
+    {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
+    {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
+    {MOVEMENT, "Fly", TOGGLE, MAIN, &f_fly},
+    {MOVEMENT, "Fast Fly", TOGGLE, MAIN, &f_fastFly},
+    {MOVEMENT, "Velocity Fly", TOGGLE, MAIN, &f_velocityFly},
+    {MOVEMENT, "Car", TOGGLE, MAIN, &f_car},
+    {MOVEMENT, "Teleport Gun", TOGGLE, MAIN, &f_tpGun},
+    {MOVEMENT, "Iron Man", TOGGLE, MAIN, &f_ironMan},
+    {MOVEMENT, "Noclip", TOGGLE, MAIN, &f_noclip},
+    {MOVEMENT, "Speed Boost", TOGGLE, MAIN, &f_speedBoost, ApplySpeedBoost},
+    {MOVEMENT, "No Gravity", TOGGLE, MAIN, &f_noGravity, ApplyGravity},
+    {MOVEMENT, "Low Gravity", TOGGLE, MAIN, &f_lowGravity},
+    {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
+    {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
+    {MOVEMENT, "Bounce", TOGGLE, MAIN, &f_bounce},
+
+
+    {RIG, "Exit Rig Mods", OPEN, MAIN},
+    {RIG, "Wave", TOGGLE, MAIN, &g_danceSel[0], DancePicked},
+    {RIG, "Helicopter", TOGGLE, MAIN, &g_danceSel[1], DancePicked},
+    {RIG, "T-Pose", TOGGLE, MAIN, &g_danceSel[2], DancePicked},
+    {RIG, "Windmill", TOGGLE, MAIN, &g_danceSel[3], DancePicked},
+    {RIG, "Swim", TOGGLE, MAIN, &g_danceSel[4], DancePicked},
+    {RIG, "Jumping Jacks", TOGGLE, MAIN, &g_danceSel[5], DancePicked},
+    {RIG, "Spaz", TOGGLE, MAIN, &g_danceSel[6], DancePicked},
+    {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
+
+    {ITEMS, "Exit Items", OPEN, MAIN},
+    {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
+    {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
+    {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
+    {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
+    {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
+
+    {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
+    {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
+    {SOUNDBOARD, "Next Song", ACTION, MAIN, nullptr, NextSong},
+    {SOUNDBOARD, "Previous Song", ACTION, MAIN, nullptr, PrevSong},
+    {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
+    {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
+    {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
+    {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
+
+    {EFFECTS, "Exit Effects", OPEN, MAIN},
+    {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
+    {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
+    {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
+    {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
+
+    {OVERPOWERED, "Exit Overpowered", OPEN, MAIN},
+    {OVERPOWERED, "Long Arms", TOGGLE, MAIN, &f_longArms, LongArmsToggled},
+    {OVERPOWERED, "Arm Length", ACTION, MAIN, nullptr, NextArmLength},
+    {OVERPOWERED, "Super Speed", TOGGLE, MAIN, &f_superSpeed, ApplySpeedBoost},
+    {OVERPOWERED, "Mega Jump", TOGGLE, MAIN, &f_megaJump},
+    {OVERPOWERED, "Jump Power", ACTION, MAIN, nullptr, NextJumpPower},
+    {OVERPOWERED, "Super Fly", TOGGLE, MAIN, &f_superFly},
+    {OVERPOWERED, "Rocket Boots", TOGGLE, MAIN, &f_rocket},
+    {OVERPOWERED, "Grapple Hook", TOGGLE, MAIN, &f_grapple},
+    {OVERPOWERED, "Ground Pound", TOGGLE, MAIN, &f_groundPound},
+    {OVERPOWERED, "Big Hands", TOGGLE, MAIN, &f_bigHands, ApplyBigHands},
+    {OVERPOWERED, "Fling Gun", TOGGLE, MAIN, &f_flingGun},
+    {OVERPOWERED, "Launch Items Gun", TOGGLE, MAIN, &f_propGun},
+    {OVERPOWERED, "Turn Overpowered Off", ACTION, MAIN, nullptr, OverpoweredOff},
+
+    {SETTINGS, "Exit Settings", OPEN, MAIN},
+    {SETTINGS, "Change Pointer Position", ACTION, MAIN, nullptr, NextPointer},
+    {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
+    {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
+    {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
+    {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
+    {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
+    {SETTINGS, "Show FPS", TOGGLE, MAIN, &f_fps},
+    {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
+    {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
+    {SETTINGS, "Turn Everything Off", ACTION, MAIN, nullptr, AllOff},
+};
+static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
+static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
+
+// Tooltips, shown under the menu while your finger is on a button (like ii's).
+static const struct { const char *label, *tip; } kTips[] = {
+    {"Settings", "Opens the settings."},
+    {"Movement Mods", "Opens the movement mods."},
+    {"Enabled Mods", "Shows every mod you have on."},
+    {"Platforms", "Hold a grip to stand on a platform."},
+    {"Fly", "Hold A to fly where you look."},
+    {"Fast Fly", "Makes Fly a lot faster."},
+    {"Velocity Fly", "Hold A to shoot where your hand points."},
+    {"Car", "Hold A to drive where you look, floating just above the ground."},
+    {"Car Speed", "Slow, normal or fast."},
+    {"Teleport Gun", "Hold right grip to aim, trigger to teleport."},
+    {"Iron Man", "Hold X and A to fly with your hands."},
+    {"Noclip", "Hold right trigger to go through walls."},
+    {"Speed Boost", "Faster and higher jumps."},
+    {"No Gravity", "Turns your gravity off."},
+    {"Low Gravity", "Jump higher, fall slower."},
+    {"Save Spot", "Remembers where you are."},
+    {"Go To Spot", "Teleports you to your saved spot."},
+    {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
+    {"Rainbow Menu", "The menu cycles through colors."},
+    {"Show FPS", "Frames per second in the title."},
+    {"Show Clock", "The time in the title."},
+    {"Rig Mods", "Pick a dance, then hold left trigger. Everyone sees it."},
+    {"Items", "Spawn copies of the item in your left hand. Everyone sees them."},
+    {"Spawn Item Gun", "Hold an item in your left hand. Right grip aims, trigger spawns it."},
+    {"Duplicate Items (3x3)", "9 of the item in your left hand appear in front of you."},
+    {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
+    {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
+    {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
+    {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
+    {"Helicopter", "Both arms spin around you. Hold left trigger."},
+    {"T-Pose", "The classic T-pose. Hold left trigger."},
+    {"Windmill", "Arms spin like a windmill. Hold left trigger."},
+    {"Swim", "Swims through the air. Hold left trigger."},
+    {"Jumping Jacks", "Arms go up and down at your sides. Hold left trigger."},
+    {"Spaz", "Hands shake all over the place. Hold left trigger."},
+    {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
+    {"Soundboard", "Plays .wav songs from the sounds folder. Only you hear them."},
+    {"Next Song", "Picks the next song in the list."},
+    {"Previous Song", "Picks the previous song in the list."},
+    {"Stop Sound", "Stops the song (and cancels a loading one)."},
+    {"Loop", "Repeats the song until you stop it."},
+    {"Sound Volume", "Quiet, medium or loud."},
+    {"Rescan Songs", "Looks in the sounds folder again."},
+    {"Effects", "Snow, rain and thunderstorms. Only you see and hear them."},
+    {"Snow", "Snow falls around you."},
+    {"Rain", "Rain falls around you."},
+    {"Thunderstorm", "Rain with lightning and thunder."},
+    {"Effect Intensity", "Light, medium or heavy."},
+    {"Overpowered", "The overpowered mods. Two pages."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
+    {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
+    {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
+    {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
+    {"Jump Power", "Small, medium, big or huge jump."},
+    {"Super Fly", "Hold A to rocket where you look."},
+    {"Rocket Boots", "Hold both triggers to shoot upward."},
+    {"Grapple Hook", "Hold either trigger (or both) to swing toward what that hand points at."},
+    {"Ground Pound", "Both grips: mace smash with a shockwave."},
+    {"Launch Items Gun", "Free-hand grip shoots local-only props."},
+    {"Bounce", "Bounce back up every time you land."},
+    {"Fling Gun", "Press A (X) to fling yourself where you point."},
+    {"Big Hands", "Your hands get a lot bigger. Held items grow too."},
+    {"Turn Overpowered Off", "Switches every Overpowered mod off."},
+    {"Change Pointer Position", "Moves the ball on your finger."},
+    {"Iron Man Speed", "Changes how strong Iron Man is."},
+    {"Right Hand Menu", "Hold B, menu on your right hand."},
+    {"Notifications", "Messages when you switch something."},
+    {"Turn Everything Off", "Switches every mod off."},
+};
+static const char *TipFor(const char *label) {
+    if (strncmp(label, "Exit ", 5) == 0) return "Returns you back to the main category.";
+    for (auto &t : kTips) if (strcmp(t.label, label) == 0) return t.tip;
+    return "";
+}
+
+// Colors in the ii menu style: an animated background and darker buttons when on.
+struct Theme { const char *name; Color bgA, bgB, button, buttonOn, title; };
+static const Theme kThemes[] = {
+    {"Plush Blue", Color(0.25f, 0.55f, 0.95f, 1), Color(0.42f, 0.72f, 1.0f, 1), Color(0.13f, 0.33f, 0.70f, 1), Color(0.05f, 0.15f, 0.42f, 1), Color(0.82f, 0.93f, 1.0f, 1)},
+    {"Orange", Color(1.0f, 0.50f, 0.0f, 1), Color(1.0f, 0.40f, 0.0f, 1), Color(0.67f, 0.33f, 0.0f, 1), Color(0.33f, 0.16f, 0.0f, 1), Color(1.0f, 0.75f, 0.49f, 1)},
+    {"Blue",   Color(0.20f, 0.50f, 1.0f, 1), Color(0.10f, 0.30f, 0.85f, 1), Color(0.10f, 0.28f, 0.65f, 1), Color(0.04f, 0.12f, 0.32f, 1), Color(0.70f, 0.85f, 1.0f, 1)},
+    {"Green",  Color(0.30f, 0.85f, 0.30f, 1), Color(0.15f, 0.65f, 0.20f, 1), Color(0.12f, 0.45f, 0.12f, 1), Color(0.05f, 0.22f, 0.05f, 1), Color(0.75f, 1.0f, 0.75f, 1)},
+    {"Purple", Color(0.65f, 0.30f, 1.0f, 1), Color(0.45f, 0.15f, 0.85f, 1), Color(0.38f, 0.15f, 0.60f, 1), Color(0.18f, 0.06f, 0.30f, 1), Color(0.88f, 0.75f, 1.0f, 1)},
+    {"Dark",   Color(0.12f, 0.12f, 0.14f, 1), Color(0.05f, 0.05f, 0.06f, 1), Color(0.22f, 0.22f, 0.25f, 1), Color(0.45f, 0.45f, 0.50f, 1), Color(0.85f, 0.85f, 0.90f, 1)},
+};
+static constexpr int kThemeCount = sizeof(kThemes) / sizeof(kThemes[0]);
+static int g_theme = 0;
+static const Theme &T() { return kThemes[g_theme]; }
+
+// ---- menu objects ----------------------------------------------------------------
+
+// Layout in meters, matching ii's menu as it was ported to Yeeps. Everything is drawn
+// on a "board" object: +x goes across, +y goes up, the player looks at it from -z.
+static constexpr int kRows = 8;                                   // buttons per page
+static const float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
+static const float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
+static const float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
+static float RowY(int r) { return 0.13f - r * 0.04f; }
+
+static Ref g_menu, g_board, g_bg, g_outline, g_pointer, g_title, g_titleBar;
+static Ref g_rowCube[kRows], g_rowLabel[kRows], g_rowText[kRows];
+static Ref g_prev, g_next, g_notifyGo, g_notifyText, g_tipText, g_leftPlatform, g_rightPlatform;
+static double g_openTime = 0, g_flashUntil = 0;
+static int g_flashRow = -2, g_hover = -2;
+static bool g_built = false, g_menuShown = false, g_dirty = true;
+static Cat g_cat = MAIN;
+static int g_page = 0;
+static std::vector<Item *> g_view;                                // what the current page list shows
+static double g_time = 0, g_nextPress = 0, g_notifyUntil = 0, g_nextTitle = 0;
+static int g_touching = -2, g_frames = 0;
+static Ref g_homeCube, g_homeLabel;
+static float g_fps = 0;
+
+static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
+
+static void BuildView() {
+    g_view.clear();
+    if (g_cat == ENABLED) {
+        g_view.push_back(&g_returnItem);
+        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify) g_view.push_back(&it);
+    } else {
+        for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
+    }
+    if (g_page >= PageCount()) g_page = 0;
+}
+
+static Il2CppObject *Label(Il2CppObject *canvasT, const char *s, Vector3 pos, float w, float h, int size, Ref *textOut) {
+    if (!G.font.get() || !G.tText) return nullptr;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("Label"));
+    Il2CppObject *text = go ? G.goAddComponent[go](G.tText) : nullptr;
+    if (!text) return nullptr;
+    Il2CppObject *t = Tr(go);
+    G.trSetParent[t](canvasT, false);
+    G.rtSetSizeDelta[t](Vector2(w * 1000, h * 1000));
+    G.trSetLocalPosition[t](pos * 1000);
+    G.trSetLocalRotation[t](Quaternion(0, 0, 0, 1));
+    G.trSetLocalScale[t](Vector3(1, 1, 1));
+    G.textSetFont[text](G.font.get());
+    G.textSetText[text](CreateMonoString(s));
+    G.textSetFontSize[text](size);
+    G.textSetAlignment[text](4);                 // MiddleCenter
+    if (G.textSetFontStyle.IsValid()) G.textSetFontStyle[text](g_customFont ? 0 : 2);   // Londrina is already chunky; the fallback font is italic
+    if (G.textSetBestFit.IsValid()) {            // shrink long labels to fit their button
+        G.textSetBestFit[text](true);
+        G.textSetMinSize[text](1);
+        G.textSetMaxSize[text](size);
+    }
+    G.graphicSetColor[text](Color(1, 1, 1, 1));
+    if (textOut) textOut->set(text);
+    return go;
+}
+
+// A world-space canvas (1 unit = 1 mm) under parent.
+static Il2CppObject *Canvas(Il2CppObject *parentT, Vector3 pos, float w, float h) {
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("StarterMenuText"));
+    Il2CppObject *canvas = go && G.tCanvas ? G.goAddComponent[go](G.tCanvas) : nullptr;
+    if (!canvas) return nullptr;
+    G.canvasSetRenderMode[canvas](2);            // WorldSpace
+    Il2CppObject *ct = Tr(go);
+    G.trSetParent[ct](parentT, false);
+    G.rtSetSizeDelta[ct](Vector2(w * 1000, h * 1000));
+    G.trSetLocalPosition[ct](pos);
+    G.trSetLocalRotation[ct](Quaternion(0, 0, 0, 1));
+    G.trSetLocalScale[ct](Vector3(0.001f, 0.001f, 0.001f));
+    return go;
+}
+
+static Il2CppObject *Part(Il2CppObject *parentT, Color c, Vector3 pos, Vector3 scale) {
+    Il2CppObject *o = Cube(c, false);
+    if (!o) return nullptr;
+    Il2CppObject *t = Tr(o);
+    G.trSetParent[t](parentT, false);
+    G.trSetLocalPosition[t](pos);
+    G.trSetLocalScale[t](scale);
+    return o;
+}
+
+// Where the ball sits on your hand (ii's four pointer positions).
+static const Vector3 kPointerSpots[] = {Vector3(0.01f, -0.017f, 0.19f), Vector3(0, -0.1f, 0.05f),
+                                        Vector3(0, 0.1f, -0.05f), Vector3(0, 0.0666f, 0.1f)};
+static int g_pointerSpot = 0;
+
+static void PointerToHand() {
+    Il2CppObject *p = g_pointer.get(), *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    if (!Alive(p) || !hand) return;
+    Il2CppObject *t = Tr(p);
+    Vector3 at = kPointerSpots[g_pointerSpot];
+    if (f_rightHand) at.x = -at.x;
+    G.trSetParent[t](hand, false);
+    G.trSetLocalPosition[t](at);
+}
+static void NextPointer() { g_pointerSpot = (g_pointerSpot + 1) % 4; PointerToHand(); Notify("Pointer position %d", g_pointerSpot + 1); }
+
+// ---- Yeeps decorations: candy-cane border, candy canes, pumpkins ------------------------
+// Plain primitives with no colliders, parented to the board, built once with the menu and
+// destroyed with it. A hard cap (kMaxDecor) keeps the object count fixed.
+static constexpr int kMaxDecor = 72;
+static int g_decorN = 0;
+static Quaternion RotZ(float rad) { return Quaternion(0, 0, sinf(rad * 0.5f), cosf(rad * 0.5f)); }
+// prim: 0 sphere, 2 cylinder, 3 cube. Positions are in the board's own space.
+static void Decor(Il2CppObject *boardT, int prim, Color c, Vector3 pos, Vector3 scale, float roll = 0) {
+    if (g_decorN >= kMaxDecor) return;
+    Il2CppObject *o = Prim(prim, c, false);
+    if (!o) return;
+    g_decorN++;
+    Il2CppObject *t = Tr(o);
+    G.trSetParent[t](boardT, false);
+    G.trSetLocalPosition[t](pos);
+    G.trSetLocalRotation[t](RotZ(roll));
+    G.trSetLocalScale[t](scale);
+}
+static void CandyCane(Il2CppObject *bt, float x, float y, float dir) {      // dir +1: the hook bends toward +x
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float z = -0.02f, h = 0.08f, d = 0.012f, R = 0.014f;
+    Decor(bt, 2, white, Vector3(x, y, z), Vector3(d, h / 2, d));
+    for (int i = 0; i < 3; i++)
+        Decor(bt, 2, red, Vector3(x, y - 0.024f + i * 0.024f, z), Vector3(d * 1.07f, 0.005f, d * 1.07f));
+    const float top = y + h / 2;
+    for (int k = 1; k <= 4; k++) {                                         // the hook: half a circle of balls
+        float a = 3.14159265f * 0.25f * k;
+        Decor(bt, 0, k % 2 ? red : white, Vector3(x + dir * (R - R * cosf(a)), top + R * sinf(a), z), Vector3(d, d, d));
+    }
+}
+static void Pumpkin(Il2CppObject *bt, float x, float y) {
+    const Color orange(1.0f, 0.45f, 0.05f, 1), dark(0.78f, 0.28f, 0.02f, 1), green(0.2f, 0.6f, 0.15f, 1), face(0.08f, 0.04f, 0.0f, 1);
+    const float z = -0.02f, front = z - 0.0245f;
+    Decor(bt, 0, dark, Vector3(x - 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));      // ribs behind
+    Decor(bt, 0, dark, Vector3(x + 0.012f, y, z + 0.006f), Vector3(0.034f, 0.040f, 0.04f));
+    Decor(bt, 0, orange, Vector3(x, y, z), Vector3(0.05f, 0.042f, 0.05f));                       // body
+    Decor(bt, 3, green, Vector3(x + 0.002f, y + 0.025f, z), Vector3(0.008f, 0.014f, 0.008f), 0.3f);   // stem
+    Decor(bt, 3, face, Vector3(x - 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);   // eyes
+    Decor(bt, 3, face, Vector3(x + 0.010f, y + 0.005f, front), Vector3(0.008f, 0.008f, 0.004f), 0.785f);
+    Decor(bt, 3, face, Vector3(x, y - 0.009f, front), Vector3(0.022f, 0.006f, 0.004f));          // mouth
+}
+static void BuildDecor(Il2CppObject *bt) {
+    g_decorN = 0;
+    const Color white(0.97f, 0.97f, 1.0f, 1), red(0.85f, 0.10f, 0.12f, 1);
+    const float hw = kBoardW / 2 + 0.004f, hh = kBoardH / 2 + 0.004f, bar = 0.008f, z = -0.002f;
+    // Candy-cane border: four white bars with red stripes across them
+    Decor(bt, 3, white, Vector3(0, hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(0, -hh, z), Vector3(kBoardW + 2 * bar, bar, 0.012f));
+    Decor(bt, 3, white, Vector3(-hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    Decor(bt, 3, white, Vector3(hw, 0, z), Vector3(bar, kBoardH, 0.012f));
+    for (int i = 0; i < 6; i++) {
+        float x = -kBoardW / 2 + (i + 0.5f) * (kBoardW / 6);
+        Decor(bt, 3, red, Vector3(x, hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(x, -hh, z), Vector3(0.022f, bar * 1.05f, 0.0125f), 0.0f);
+    }
+    for (int i = 0; i < 8; i++) {
+        float y = -kBoardH / 2 + (i + 0.5f) * (kBoardH / 8);
+        Decor(bt, 3, red, Vector3(-hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+        Decor(bt, 3, red, Vector3(hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
+    }
+    CandyCane(bt, -kSideX, kTitleY, 1);
+    CandyCane(bt, kSideX, kTitleY, -1);
+    Pumpkin(bt, -kSideX, -0.215f);
+    Pumpkin(bt, kSideX, -0.215f);
+    ym::log("clientdabell: %d decorations", g_decorN);
+}
+
+// Built once per room; afterwards only shown/hidden, moved and relabeled.
+static void BuildMenu() {
+    auto NewObject = [](const char *name) {
+        return Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString(name));
+    };
+    Il2CppObject *menu = NewObject("ClientDaBellMenu"), *board = NewObject("ClientDaBellMenuBoard");
+    if (!menu || !board) return;
+    g_menu.set(menu);
+    g_board.set(board);
+    Il2CppObject *bt = Tr(board);
+    G.trSetParent[bt](Tr(menu), false);
+    // Like ii's menu: the board stands 10 cm out from the hand on its +x side, facing +x.
+    G.trSetLocalPosition[bt](Vector3(0.1f, 0, 0));
+    G.trSetLocalRotation[bt](Quaternion::LookRotation(Vector3(-1, 0, 0), Vector3(0, 0, 1)));
+
+    g_outline.set(Part(bt, T().title, Vector3(0, 0, 0.004f), Vector3(kBoardW + 0.008f, kBoardH + 0.008f, 0.004f)));
+    g_bg.set(Part(bt, T().bgA, Vector3(0, 0, 0), Vector3(kBoardW, kBoardH, 0.01f)));
+    for (int r = 0; r < kRows; r++)
+        g_rowCube[r].set(Part(bt, T().button, Vector3(0, RowY(r), -0.005f), Vector3(kBtnW, kBtnH, 0.009f)));
+    g_prev.set(Part(bt, T().button, Vector3(-kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
+    // The title sits on its own dark bar above the board (where ii's Disconnect button was)
+    g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
+    g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
+    g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
+
+    if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
+        Il2CppObject *ct = Tr(canvas);
+        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        for (int r = 0; r < kRows; r++)
+            g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
+        Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
+        Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
+        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, 19, nullptr));
+        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.09f, 0), kBoardW, 0.03f, 17, &g_tipText);
+        Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
+    }
+    BuildDecor(bt);
+    // Pointer: a small ball on the index finger of the other hand
+    if (Il2CppObject *p = Prim(0, T().bgB, false)) {
+        G.trSetLocalScale[Tr(p)](Vector3(0.01f, 0.01f, 0.01f));
+        g_pointer.set(p);
+        PointerToHand();
+    }
+    // Notifications: a line of text low in your view, like ii's notifications
+    if (Il2CppObject *n = Canvas(g_head.get(), Vector3(0, -0.12f, 0.6f), 0.5f, 0.05f)) {
+        g_notifyGo.set(n);
+        Label(Tr(n), "", Vector3(0, 0, 0), 0.5f, 0.05f, 22, &g_notifyText);
+        G.goSetActive[n](false);
+    }
+    G.goSetActive[menu](false);
+    Show(g_pointer, false);
+    g_built = true;
+    g_dirty = true;
+}
+
+static void Notify(const char *fmt, ...) {
+    if (!f_notify || !Alive(g_notifyGo.get())) return;
+    char buf[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    SetText(g_notifyText, buf);
+    G.goSetActive[g_notifyGo.get()](true);
+    g_notifyUntil = g_time + 2.0;
+}
+
+// Relabels and recolors the rows. Only runs after something changed.
+static void RenderPage() {
+    BuildView();
+    for (int r = 0; r < kRows; r++) {
+        int i = g_page * kRows + r;
+        bool used = i < (int)g_view.size();
+        Show(g_rowCube[r], used);
+        Show(g_rowLabel[r], used);
+        if (!used) continue;
+        Item *it = g_view[i];
+        bool on = it->kind == TOGGLE && *it->flag;
+        SetText(g_rowText[r], it->label);
+        SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 0.9f, 0.6f, 1) : on ? T().buttonOn : T().button);
+        if (Alive(g_rowText[r].get())) G.graphicSetColor[g_rowText[r].get()](on ? Color(1, 1, 1, 1) : T().title);
+    }
+    bool pages = PageCount() > 1;
+    Show(g_prev, pages);
+    Show(g_next, pages);
+    SetColor(g_prev.get(), T().button);
+    SetColor(g_next.get(), T().button);
+    Show(g_homeCube, g_cat != MAIN);
+    Show(g_homeLabel, g_cat != MAIN);
+    SetColor(g_homeCube.get(), g_flashRow == -3 ? Color(1, 0.9f, 0.6f, 1) : T().button);
+    SetColor(g_outline.get(), T().title);
+    SetColor(g_titleBar.get(), T().buttonOn);
+    SetColor(g_pointer.get(), T().bgB);
+    if (Alive(g_title.get())) G.graphicSetColor[g_title.get()](Color(1, 1, 1, 1));
+    g_nextTitle = 0;                     // refresh the title now
+    g_dirty = false;
+}
+
+static int Hex(float v) { return (int)(v < 0 ? 0 : v > 1 ? 255 : v * 255); }
+
+// The title is "ClientDaBell" with a moving plush-blue gradient, one color per letter
+// (rich text). Rebuilt ten times a second, not every frame.
+static void UpdateTitle() {
+    if (g_time < g_nextTitle) return;
+    g_nextTitle = g_time + 0.1;
+    static const Color kFire[] = {Color(0.20f, 0.50f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1), Color(0.85f, 0.95f, 1.0f, 1), Color(0.45f, 0.75f, 1.0f, 1)};   // plush blue shimmer
+    char buf[1024];
+    int n = 0;
+    const char *word = "ClientDaBell";
+    for (int i = 0; word[i]; i++) {
+        float t = (float)g_time * 1.5f - i * 0.35f;
+        Color c;
+        if (f_rainbow) c = Rainbow(t * 0.2f);
+        else {
+            float f = t - floorf(t / 4) * 4;          // 0..4 along the fire colors
+            int k = (int)f;
+            c = Lerp(kFire[k], kFire[(k + 1) % 4], f - k);
+        }
+        n += snprintf(buf + n, sizeof buf - n, "<b><color=#%02X%02X%02X>%c</color></b>", Hex(c.r), Hex(c.g), Hex(c.b), word[i]);
+    }
+    n += snprintf(buf + n, sizeof buf - n, " <color=grey>[</color><color=white>%d</color><color=grey>]</color>", g_page + 1);
+    if (f_fps) n += snprintf(buf + n, sizeof buf - n, "<size=16>  %d fps</size>", (int)(g_fps + 0.5f));
+    if (f_clock) {
+        time_t now = time(nullptr);
+        struct tm lt;
+        localtime_r(&now, &lt);
+        n += snprintf(buf + n, sizeof buf - n, "<size=16>  %d:%02d</size>", lt.tm_hour % 12 ? lt.tm_hour % 12 : 12, lt.tm_min);
+    }
+    SetText(g_title, buf);
+}
+
+static void ShowMenu(bool show) {
+    if (show == g_menuShown) return;
+    g_menuShown = show;
+    if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); }
+    Show(g_menu, show);
+    Show(g_pointer, show);
+    g_touching = -2;
+}
+
+static float Dot(Vector3 a, Vector3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+// Like ii's menu: the menu follows your hand and is tipped 45 degrees, so you read it
+// by turning your palm toward your face. "Floating Menu" instead keeps the board above
+// your hand, always facing you.
+static void PlaceMenu() {
+    Il2CppObject *menu = g_menu.get(), *board = g_board.get(), *head = g_head.get();
+    Il2CppObject *hand = f_rightHand ? g_rightHand.get() : g_leftHand.get();
+    if (!Alive(menu) || !Alive(board) || !hand || !head) return;
+    Il2CppObject *t = Tr(menu), *bt = Tr(board);
+    Vector3 handPos = G.trGetPosition[hand]();
+    if (!G.trGetRotation.IsValid()) {                  // fallback: float above the hand, facing you
+        Vector3 center = handPos + Vector3(0, 0.25f, 0), away = center - G.trGetPosition[head]();
+        if (away.x * away.x + away.y * away.y + away.z * away.z < 1e-6f) return;
+        G.trSetPosition[t](handPos);
+        G.trSetPosition[bt](center);
+        G.trSetRotation[bt](Quaternion::LookRotation(away));
+        return;
+    }
+    const float s = 0.38268343f, c = 0.92387953f;                  // sin/cos of 22.5 degrees
+    Quaternion rot = G.trGetRotation[hand]() * Quaternion(-s, 0, 0, c);   // tip -45 degrees on x
+    if (f_rightHand) rot = rot * Quaternion(0, 0, 1, 0);           // mirrored: 180 degrees on z
+    G.trSetPosition[t](handPos);
+    G.trSetRotation[t](rot);
+    G.trSetLocalPosition[bt](Vector3(0.1f, 0, 0));
+    G.trSetLocalRotation[bt](Quaternion::LookRotation(Vector3(-1, 0, 0), Vector3(0, 0, 1)));
+}
+
+static void Press(Item *it) {
+    switch (it->kind) {
+    case OPEN:
+        g_cat = it->target;
+        g_page = 0;
+        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
+        break;
+    case TOGGLE:
+        *it->flag = !*it->flag;
+        if (it->fn) it->fn();
+        Notify("[%s] %s", *it->flag ? "ON" : "OFF", it->label);
+        break;
+    case ACTION:
+        if (it->fn) it->fn();
+        break;
+    }
+    g_dirty = true;
+    ym::log("clientdabell: %s", it->label);
+}
+
+// Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
+static int Touching() {
+    Il2CppObject *board = g_board.get(), *pointer = g_pointer.get();
+    if (!Alive(board) || !Alive(pointer)) return -2;
+    Vector3 p = G.trInverseTransformPoint[Tr(board)](G.trGetPosition[Tr(pointer)]());
+    if (p.z < -0.035f || p.z > 0.015f) return -2;
+    if (g_cat != MAIN && fabsf(p.x) < kHomeW / 2 && fabsf(p.y - kHomeY) < kHomeH / 2) return -3;
+    if (fabsf(fabsf(p.x) - kSideX) < kSideW / 2 && fabsf(p.y) < kSideH / 2 && PageCount() > 1)
+        return p.x < 0 ? -1 : kRows;
+    if (fabsf(p.x) >= kBtnW / 2) return -2;
+    for (int r = 0; r < kRows; r++)
+        if (fabsf(p.y - RowY(r)) < kBtnH / 2) return r;
+    return -2;
+}
+
+static void Buzz() {
+    if (!G.haptic.IsValid()) return;
+    XRDevice d = G.deviceAtNode(f_rightHand ? 4 : 5);    // the hand that presses
+    if (d.initialized) G.haptic(d.id, 0u, 0.35f, 0.04f);
+}
+
+static void CheckPress() {
+    int hit = Touching();
+    if (hit != g_hover) {                                 // tooltip for the button under your finger
+        g_hover = hit;
+        int i = g_page * kRows + hit;
+        if (hit >= 0 && hit < kRows && i < (int)g_view.size()) SetText(g_tipText, TipFor(g_view[i]->label));
+    }
+    if (hit != -2 && hit != g_touching && g_time >= g_nextPress) {   // one press per touch
+        g_nextPress = g_time + 0.25;
+        Buzz();
+        if (hit >= 0 && hit < kRows) { g_flashRow = hit; g_flashUntil = g_time + 0.12; }
+        if (hit == -3) {                                  // Home: back to the main page
+            g_cat = MAIN;
+            g_page = 0;
+            g_flashRow = -3; g_flashUntil = g_time + 0.12;
+            g_dirty = true;
+        } else if (hit == -1 || hit == kRows) {
+            int n = PageCount();
+            g_page = (g_page + (hit == kRows ? 1 : n - 1)) % n;
+            g_dirty = true;
+        } else {
+            int i = g_page * kRows + hit;
+            if (i < (int)g_view.size()) Press(g_view[i]);
+        }
+    }
+    g_touching = hit;
+}
+
+static void AnimateMenu() {
+    float open = (float)(g_time - g_openTime) / 0.15f;     // pop open like ii's menu
+    if (open <= 1.05f && Alive(g_menu.get())) {
+        float k = open >= 1 ? 1 : 1 - (1 - open) * (1 - open);
+        G.trSetLocalScale[Tr(g_menu.get())](Vector3(k, k, k));
+    }
+    if (g_flashRow != -2 && g_time >= g_flashUntil) { g_flashRow = -2; g_dirty = true; }
+    float t = 0.5f + 0.5f * sinf((float)g_time * 2.0f);
+    Color c = f_rainbow ? Rainbow((float)g_time * 0.15f) : Lerp(T().bgA, T().bgB, t);
+    SetColor(g_bg.get(), c);
+}
+
+// ---- features (local only) -----------------------------------------------------
+
+static Il2CppObject *PlayerTransform() {
+    Il2CppObject *player = g_player.get();
+    return player ? G.compTransform[player]() : nullptr;
+}
+
+// Your body's velocity, through the game's own player functions (Rigidbody as backup).
+static bool GetVel(Vector3 &v) {
+    Il2CppObject *player = g_player.get(), *rb = g_rigidbody.get();
+    if (player && G.plGetVelocity.IsValid()) { v = G.plGetVelocity[player](); return true; }
+    if (rb && G.rbGetVelocity.IsValid()) { v = G.rbGetVelocity[rb](); return true; }
+    return false;
+}
+static void SetVel(Vector3 v) {
+    Il2CppObject *player = g_player.get(), *rb = g_rigidbody.get();
+    if (player && G.plSetVelocity.IsValid()) G.plSetVelocity[player](v);
+    else if (rb && G.rbSetVelocity.IsValid()) G.rbSetVelocity[rb](v);
+}
+
+// Where your body is (the body collider), which is what teleports aim for.
+static bool BodyPos(Vector3 &out) {
+    Il2CppObject *player = g_player.get(), *t = PlayerTransform();
+    if (!player || !t) return false;
+    Il2CppObject *body = G.bodyCollider.IsValid() ? G.bodyCollider[player]() : nullptr;
+    out = body ? G.trGetPosition[G.compTransform[body]()]() : G.trGetPosition[t]();
+    return true;
+}
+static void StopMoving() { SetVel(Vector3(0, 0, 0)); }
+// Moves your body to pos, using the game's own TeleportTo when it has one.
+static void TeleportPlayer(Vector3 pos) {
+    Il2CppObject *player = g_player.get(), *t = PlayerTransform();
+    Vector3 body;
+    if (!player || !t || !BodyPos(body)) return;
+    Vector3 target = pos - body + G.trGetPosition[t]();
+    if (G.teleportTo.IsValid()) G.teleportTo[player](target);
+    else G.trSetPosition[t](target);
+    StopMoving();
+}
+
+static void SaveSpot() {
+    if (BodyPos(g_spot)) { g_haveSpot = true; Notify("Spot saved"); }
+}
+static void GoToSpot() {
+    if (!g_haveSpot) { Notify("Save a spot first"); return; }
+    TeleportPlayer(g_spot);
+    Notify("Teleported to your spot");
+}
+
+static const float kIronSpeeds[] = {15, 12, 8, 4};
+static int g_ironSpeed = 0;
+static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
+static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
+static void AllOff() {
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
+    g_dance = -1;
+    g_dupeArmed = 0;
+    g_wx = -1;
+    StopSound();
+    g_itemQueue.clear();
+    PointerToHand();
+    Notify("Everything off");
+}
+
+static void FlyTick(const Buttons &in, float dt) {
+    Il2CppObject *head = g_head.get(), *t = PlayerTransform();
+    if (!f_fly || !in.a || !head || !t) return;
+    Vector3 pos = G.trGetPosition[t]() + G.trGetForward[head]() * ((f_fastFly ? 20.0f : 8.0f) * dt);
+    G.trSetPosition[t](pos);
+    StopMoving();
+}
+
+static void LowGravityTick(const Buttons &in, float dt) {
+    Vector3 v;
+    if (!f_lowGravity || f_noGravity || (f_fly && in.a) || !GetVel(v)) return;
+    SetVel(v + Vector3(0, 9.81f * 0.7f * dt, 0));       // cancels 70% of gravity
+}
+
+static void PlatformFor(bool held, Ref &platform, Ref &hand) {
+    if (!held || !f_platforms) {
+        Kill(platform);
+        return;
+    }
+    if (platform.get()) return;                             // already standing on one
+    if (!hand.get()) return;
+    Il2CppObject *p = Cube(T().button, true);               // keeps its collider: you stand on it
+    if (!p) return;
+    // Hands only collide with the layers in the player's locomotionEnabledLayers (like
+    // Gorilla Tag), so the platform goes on the first of those layers.
+    static int layer = -2;
+    if (layer == -2) {
+        layer = -1;
+        int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : 0;
+        for (int i = 0; i < 32 && layer < 0; i++) if (mask & (1 << i)) layer = i;
+        ym::log("clientdabell: hand layers 0x%x, platforms on layer %d", mask, layer);
+    }
+    if (layer >= 0 && G.goSetLayer.IsValid()) G.goSetLayer[p](layer);
+    Il2CppObject *t = Tr(p);
+    G.trSetPosition[t](G.trGetPosition[hand.get()]() - Vector3(0, 0.08f, 0));
+    G.trSetLocalScale[t](Vector3(0.28f, 0.02f, 0.28f));
+    platform.set(p);
+}
+
+static void VelocityFlyTick(const Buttons &in) {
+    Il2CppObject *hand = g_rightHand.get();
+    if (!f_velocityFly || !in.a || !hand) return;
+    SetVel(G.trGetForward[hand]() * 20.0f);
+}
+
+static Vector3 Flat(Vector3 v);
+
+// Car: like Fly, but along the ground. Holding A drives you the way you look, flat, and
+// you hover a little above the ground (a raycast down finds it) so the bumps on blocks
+// don't catch you. Off a ledge, with no ground close below, you fall normally.
+static const float kCarSpeeds[] = {4.0f, 6.0f, 9.0f};
+static const char *kCarNames[] = {"slow", "normal", "fast"};
+static int g_carSpeed = 1;
+static float g_carHeight = -1;               // your head's height above the ground, measured once
+static void NextCarSpeed() { g_carSpeed = (g_carSpeed + 1) % 3; Notify("Car: %s", kCarNames[g_carSpeed]); }
+static void CarTick(const Buttons &in) {
+    Il2CppObject *head = g_head.get(), *player = g_player.get();
+    Vector3 v;
+    if (!f_car) { g_carHeight = -1; return; }
+    if (!in.a || !head || !player || !GetVel(v) || !G.raycast.IsValid()) return;
+    int mask = G.locomotionLayers.IsValid() ? G.locomotionLayers[player]() : -5;
+    Vector3 hp = G.trGetPosition[head]();
+    BNM::Structures::Unity::RaycastHit hit{};
+    bool ground = G.raycast(hp, Vector3(0, -1, 0), &hit, 3.0f, mask ? mask : -5);
+    Vector3 f = Flat(G.trGetForward[head]()) * kCarSpeeds[g_carSpeed];
+    float vy = fminf(v.y, 1.0f);
+    if (ground) {
+        if (g_carHeight < 0) g_carHeight = hp.y - hit.point.y;      // your standing height
+        float target = hit.point.y + g_carHeight + 0.15f;            // float 15 cm higher
+        vy = (target - hp.y) * 8.0f;
+        if (G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
+    }
+    SetVel(Vector3(f.x, vy, f.z));
+}
+
+static void IronManTick(const Buttons &in, float dt) {
+    Vector3 v;
+    if (!f_ironMan || !G.trGetRight.IsValid() || (!in.x && !in.a) || !GetVel(v)) return;
+    float speed = kIronSpeeds[g_ironSpeed] * dt;
+    if (in.x && g_leftHand.get()) v = v + G.trGetRight[g_leftHand.get()]() * -speed;
+    if (in.a && g_rightHand.get()) v = v + G.trGetRight[g_rightHand.get()]() * speed;
+    SetVel(v);
+}
+
+// Speed Boost and No Gravity change your own player; turning them off puts the old
+// values back. Checked every frame so they also come back after a room change.
+static float g_oldJumpSpeed = 0, g_oldJumpMultiplier = 0;
+static Il2CppObject *g_boosted = nullptr;      // which player has the boost (compared only)
+static bool g_gravityOff = false;
+
+static int g_boostLevel = 0;                   // 1 = Speed Boost, 2 = Super Speed
+static void ApplySpeedBoost() {
+    Il2CppObject *player = g_player.get();
+    bool ok = G.maxJumpSpeed.IsValid() && G.jumpMultiplier.IsValid();
+    int level = f_superSpeed ? 2 : f_speedBoost ? 1 : 0;
+    if (level && ok && player) {
+        if (g_boosted != player) {                 // first time on this player: remember the normal values
+            g_oldJumpSpeed = G.maxJumpSpeed[player]();
+            g_oldJumpMultiplier = G.jumpMultiplier[player]();
+            g_boosted = player;
+            g_boostLevel = 0;
+        }
+        if (g_boostLevel != level) {
+            G.maxJumpSpeed[player] = level == 2 ? 20.0f : 9.0f;
+            G.jumpMultiplier[player] = level == 2 ? 3.0f : 1.5f;
+            g_boostLevel = level;
+        }
+    } else if (!level && g_boosted) {
+        if (ok && player == g_boosted) {
+            G.maxJumpSpeed[player] = g_oldJumpSpeed;
+            G.jumpMultiplier[player] = g_oldJumpMultiplier;
+        }
+        g_boosted = nullptr;
+        g_boostLevel = 0;
+    }
+}
+
+static void ApplyGravity() {
+    // The game's own "no gravity for a while" (what its levitation items use), renewed
+    // every frame while the mod is on; it wears off by itself once you turn it off.
+    Il2CppObject *player = g_player.get();
+    if (f_noGravity && player && G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.25f);
+    g_gravityOff = f_noGravity;
+}
+
+// Noclip: while you hold the right trigger you pass through everything. Yeeps moves
+// your body with its own layer lists (locomotionEnabledLayers for your hands,
+// collisionEnabledLayers for your body), so those are emptied, physics ignores your
+// body against those layers, and your own colliders are off. Gravity stays normal, like
+// Gorilla Tag noclip. All of it goes back when you let go. Only your own player changes; nothing is sent.
+static bool g_noclipOn = false;
+static Ref g_noclipOff[24];                    // your own colliders switched off during noclip
+static int g_noclipOffN = 0;
+// Every solid collider on your own player (body, head, hands...), switched off while
+// noclip is held so nothing of you hits the level.
+static void PlayerColliders(bool off) {
+    if (!off) {
+        for (int i = 0; i < g_noclipOffN; i++) {
+            if (Alive(g_noclipOff[i].get())) G.colliderSetEnabled[g_noclipOff[i].get()](true);
+            g_noclipOff[i].clear();
+        }
+        g_noclipOffN = 0;
+        return;
+    }
+    Il2CppObject *player = g_player.get();
+    if (!player || !G.colliderSetEnabled.IsValid()) return;
+    auto offOne = [](Il2CppObject *c) {
+        if (!Alive(c) || g_noclipOffN >= 24 || !G.behaviourGetEnabledCollider[c]()) return;
+        if (G.colliderIsTrigger.IsValid() && G.colliderIsTrigger[c]()) return;
+        for (int i = 0; i < g_noclipOffN; i++) if (g_noclipOff[i].get() == c) return;
+        G.colliderSetEnabled[c](false);
+        g_noclipOff[g_noclipOffN++].set(c);
+    };
+    // Your body and head colliders (fields on the player), then every solid collider in
+    // the rig they belong to.
+    Il2CppObject *own[2] = {G.bodyCollider.IsValid() ? G.bodyCollider[player]() : nullptr,
+                            G.headCollider.IsValid() ? G.headCollider[player]() : nullptr};
+    for (Il2CppObject *c : own) {
+        if (!c) continue;
+        offOne(c);
+        Il2CppObject *rig = G.compGameObject[G.trGetRoot[G.compTransform[c]()]()]();
+        auto *arr = rig && G.getComponentsInChildren.IsValid()
+                        ? (uint8_t *)G.getComponentsInChildren[rig]((Il2CppObject *)G.tCollider, false) : nullptr;
+        size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        for (size_t i = 0; i < n; i++) offOne(((Il2CppObject **)(arr + 0x20))[i]);
+    }
+}
+static int g_savedLoco = 0, g_savedColl = 0, g_bodyLayer = -1;
+static void NoclipTick(const Buttons &in) {
+    Il2CppObject *player = g_player.get();
+    bool want = f_noclip && in.rtrig && player;
+    if (want == g_noclipOn) return;
+    g_noclipOn = want;
+    if (!player || !G.locomotionLayers.IsValid()) return;
+    if (want) {
+        g_savedLoco = G.locomotionLayers[player]();
+        g_savedColl = G.collisionLayers.IsValid() ? G.collisionLayers[player]() : 0;
+        Il2CppObject *body = G.bodyCollider.IsValid() ? G.bodyCollider[player]() : nullptr;
+        Il2CppObject *bodyGo = body ? G.compGameObject[body]() : nullptr;
+        g_bodyLayer = bodyGo && G.goGetLayer.IsValid() ? G.goGetLayer[bodyGo]() : -1;
+    }
+    int mask = g_savedLoco | g_savedColl;
+    G.locomotionLayers[player] = want ? 0 : g_savedLoco;
+    if (G.collisionLayers.IsValid()) G.collisionLayers[player] = want ? 0 : g_savedColl;
+    if (g_bodyLayer >= 0 && G.ignoreLayers.IsValid())
+        for (int l = 0; l < 32; l++)
+            if (mask & (1 << l)) G.ignoreLayers(g_bodyLayer, l, want);
+    PlayerColliders(want);
+    if (want) ym::log("clientdabell: noclip on (layers 0x%x, body layer %d, %d colliders off)", mask, g_bodyLayer, g_noclipOffN);
+}
+
+// Teleport Gun: hold right grip to aim (a line and a ball show where you land), press
+// the right trigger to go there.
+static Ref g_gunLine, g_gunLineGo, g_gunBall;
+static bool g_gunTrigger = false;
+static void TeleportGunTick(const Buttons &in) {
+    bool aiming = (f_tpGun || f_itemGun) && in.rgrip;
+    if (!aiming) {
+        Show(g_gunLineGo, false);
+        Show(g_gunBall, false);
+        g_gunTrigger = in.rtrig;
+        return;
+    }
+    Il2CppObject *hand = g_rightHand.get();
+    if (!hand || !G.raycast.IsValid() || !G.lrSetPosition.IsValid()) return;
+    if (!g_gunBall.get()) {                              // made once per room
+        Il2CppObject *ball = Prim(0, T().bgB, false);
+        Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGunLine"));
+        Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
+        if (!ball || !line) return;
+        G.trSetLocalScale[Tr(ball)](Vector3(0.1f, 0.1f, 0.1f));
+        if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
+            if (G.shader.get()) G.matSetShader[m](G.shader.get());
+            G.matSetColor[m](T().bgB);
+        }
+        G.lrSetStartWidth[line](0.025f);
+        G.lrSetEndWidth[line](0.025f);
+        G.lrSetPositionCount[line](2);
+        G.lrSetUseWorldSpace[line](true);
+        g_gunBall.set(ball);
+        g_gunLine.set(line);
+        g_gunLineGo.set(lineGo);
+    }
+    Vector3 start = G.trGetPosition[hand](), dir = G.trGetForward[hand]();
+    BNM::Structures::Unity::RaycastHit hit{};
+    bool found = G.raycast(start + dir * 0.25f, dir, &hit, 512.0f, -5);   // Physics.DefaultRaycastLayers
+    Vector3 end = found ? hit.point : start + dir * 512.0f;
+    Show(g_gunLineGo, true);
+    Show(g_gunBall, true);
+    G.trSetPosition[Tr(g_gunBall.get())](end);
+    G.lrSetPosition[g_gunLine.get()](0, start);
+    G.lrSetPosition[g_gunLine.get()](1, end);
+    SetColor(g_gunBall.get(), in.rtrig ? T().buttonOn : T().bgB);
+    if (in.rtrig && !g_gunTrigger && found) {
+        if (f_itemGun) {                                  // Spawn Item Gun: an item at that spot
+            if (g_time >= g_nextItem && LeftHandItem()) {
+                g_nextItem = g_time + 0.5;
+                g_itemQueue.push_back({end + Vector3(0, 0.3f, 0), Vector3(0, 0, 0)});
+            }
+        } else TeleportPlayer(end + Vector3(0, 1.0f, 0));
+    }
+    g_gunTrigger = in.rtrig;
+}
+
+// ---- vector helpers ----------------------------------------------------------------
+
+static Vector3 Cross(Vector3 a, Vector3 b) { return Vector3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+static Vector3 Flat(Vector3 v) {                      // v without its up/down part, length 1
+    v.y = 0;
+    float l = sqrtf(v.x * v.x + v.z * v.z);
+    return l > 1e-4f ? v * (1.0f / l) : Vector3(0, 0, 1);
+}
+
+// ---- rig mods: dances -----------------------------------------------------------
+// While you hold the left trigger, your hands are moved through a dance instead of
+// following your controllers. The game sends your hand positions to the room as
+// usual, so other players see you dance. Nothing extra is sent.
+
+// The dance buttons work like radio buttons: picking one turns the others off,
+// pressing the picked one again turns dancing off.
+static void DancePicked() {
+    int picked = -1;
+    for (int i = 0; i < kDances; i++) if (g_danceSel[i] && i != g_dance) picked = i;
+    for (int i = 0; i < kDances; i++) g_danceSel[i] = (i == picked);
+    g_dance = picked;
+    if (picked >= 0) Notify("Hold left trigger to dance");
+}
+static float Rand01() { static uint32_t x = 2463534242u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return (x & 0xffff) / 65535.0f; }
+
+// The controller trackers would put your hands back every frame, so they are paused
+// while you dance (on the hand and the two objects above it) and turned back on after.
+static Ref g_paused[12];
+static int g_pausedN = 0;
+static bool g_dancing = false;
+static void PauseTrackers(bool pause) {
+    if (!pause) {
+        for (int i = 0; i < g_pausedN; i++) {
+            if (Alive(g_paused[i].get())) G.behaviourSetEnabled[g_paused[i].get()](true);
+            g_paused[i].clear();
+        }
+        g_pausedN = 0;
+        return;
+    }
+    if (!G.behaviourSetEnabled.IsValid() || !G.trGetParent.IsValid()) return;
+    for (Il2CppObject *t : {g_leftHand.get(), g_rightHand.get()})
+        for (int up = 0; up < 3 && t; up++, t = G.trGetParent[t]())
+            for (BNM::MonoType *type : G.trackerTypes) {
+                Il2CppObject *go = G.compGameObject[t]();
+                Il2CppObject *c = go ? G.goGetComponent[go]((Il2CppObject *)type) : nullptr;
+                if (!c || !G.behaviourGetEnabled[c]() || g_pausedN >= 12) continue;
+                G.behaviourSetEnabled[c](false);
+                g_paused[g_pausedN++].set(c);
+            }
+}
+
+static void DanceTick(const Buttons &in, float dt) {
+    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    bool want = g_dance >= 0 && in.ltrig && head && lh && rh;
+    if (want != g_dancing) {
+        PauseTrackers(want);
+        g_dancing = want;
+        if (want) ym::log("clientdabell: dancing, paused %d trackers", g_pausedN);
+    }
+    if (!want) return;
+    Vector3 hp = G.trGetPosition[head](), f = Flat(G.trGetForward[head]()), up(0, 1, 0);
+    Vector3 r = Cross(up, f);                            // your right
+    Vector3 shoulder = hp + up * -0.25f;
+    float t = (float)g_time, s = sinf(t * 6), c = cosf(t * 6);
+    Vector3 L, R;                                        // hand positions
+    switch (g_dance) {
+    case 0:   // Wave: right hand up and waving, left hand on the hip
+        R = shoulder + r * (0.35f + 0.12f * s) + up * 0.45f + f * 0.1f;
+        L = shoulder + r * -0.25f + up * -0.25f + f * 0.05f;
+        break;
+    case 1:   // Helicopter: both hands spin around you
+        R = shoulder + r * (0.6f * cosf(t * 8)) + f * (0.6f * sinf(t * 8)) + up * 0.15f;
+        L = shoulder - r * (0.6f * cosf(t * 8)) - f * (0.6f * sinf(t * 8)) + up * 0.15f;
+        break;
+    case 2:   // T-Pose
+        R = shoulder + r * 0.7f + up * 0.1f;
+        L = shoulder - r * 0.7f + up * 0.1f;
+        break;
+    case 3:   // Windmill: big circles at your sides
+        R = shoulder + r * 0.4f + up * (0.5f * sinf(-t * 5)) + f * (0.5f * cosf(-t * 5));
+        L = shoulder - r * 0.4f - up * (0.5f * sinf(-t * 5)) - f * (0.5f * cosf(-t * 5));
+        break;
+    case 4: {  // Swim: breaststroke
+        float p = t * 3;
+        R = shoulder + f * (0.3f + 0.25f * cosf(p)) + r * (0.08f + 0.35f * fabsf(sinf(p)));
+        L = shoulder + f * (0.3f + 0.25f * cosf(p)) - r * (0.08f + 0.35f * fabsf(sinf(p)));
+        break;
+    }
+    case 5: {  // Jumping jacks: arms from down by your sides to up over your head
+        float a = (sinf(t * 6) * 0.5f + 0.5f) * 3.1f - 1.55f;
+        R = shoulder + r * (0.6f * cosf(a)) + up * (0.6f * sinf(a));
+        L = shoulder - r * (0.6f * cosf(a)) + up * (0.6f * sinf(a));
+        break;
+    }
+    case 6:   // Spaz: hands in front, shaking everywhere
+        R = shoulder + f * 0.35f + r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
+        L = shoulder + f * 0.35f - r * 0.2f + Vector3(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f) * 0.3f;
+        break;
+    default:  // Beyblade: hands spin fast around your waist
+        R = shoulder - up * 0.3f + r * (0.5f * cosf(t * 20)) + f * (0.5f * sinf(t * 20));
+        L = shoulder - up * 0.3f - r * (0.5f * cosf(t * 20)) - f * (0.5f * sinf(t * 20));
+        break;
+    }
+    // Keep each hand within arm's reach of its shoulder, then glide there instead of
+    // jumping, so the arms move smoothly for you and for everyone watching.
+    auto reach = [&](Vector3 hand, Vector3 sh) {
+        Vector3 d = hand - sh;
+        float len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+        return len > 0.7f ? sh + d * (0.7f / len) : hand;
+    };
+    R = reach(R, shoulder + r * 0.18f);
+    L = reach(L, shoulder - r * 0.18f);
+    float k = g_dance == 6 ? 1.0f : fminf(1.0f, dt * 14.0f);     // Spaz stays twitchy
+    G.trSetPosition[lh](G.trGetPosition[lh]() + (L - G.trGetPosition[lh]()) * k);
+    G.trSetPosition[rh](G.trGetPosition[rh]() + (R - G.trGetPosition[rh]()) * k);
+    Quaternion look = Quaternion::LookRotation(f, up);
+    G.trSetRotation[lh](look);
+    G.trSetRotation[rh](look);
+}
+
+// ---- items (everyone sees these) ------------------------------------------------
+// Items are made with the game's own item message (RpcCreateItem on the room's
+// NetworkMessenger), the same one the game sends when an item appears. Owner-approved
+// 2026-10-31. Every way of spawning has a cooldown, and big batches are sent a few per
+// frame, so the room can't be flooded.
+
+
+static void Put(Il2CppObject *arr, size_t i, void *v) { ((void **)((uint8_t *)arr + 0x20))[i] = v; }
+
+// Builds RpcCreateItem's arguments from its own parameter list, in the order the game
+// uses: item id, item key, spawn kind 1, no owner, position, rotation, velocity, spin,
+// properties, 1, 1.
+static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, char *idOut = nullptr) {
+    auto *mi = G.rpcCreateItem;
+    Il2CppObject *nm = G.netLocal.IsValid() ? G.netLocal() : nullptr;
+    if (!mi || !nm || !G.pvRpc.IsValid() || !G.arrayNew || !G.valueBox || !G.tPhotonView) return false;
+    Il2CppObject *go = G.compGameObject[nm]();
+    Il2CppObject *pv = go ? G.goGetComponent[go]((Il2CppObject *)G.tPhotonView) : nullptr;
+    if (!pv) return false;
+    // The last parameter (PhotonMessageInfo) is filled in by Photon on the receiving
+    // side; it is never sent.
+    int count = mi->parameters_count;
+    if (count > 0 && TypeName(mi->parameters[count - 1]) == "Photon.Pun.PhotonMessageInfo") count--;
+    auto *args = (Il2CppObject *)G.arrayNew(G.objectClass, count);
+    if (!args) return false;
+    char id[8];
+    static const char kChars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (int i = 0; i < 4; i++) id[i] = kChars[(int)(Rand01() * 35.99f)];
+    id[4] = 0;
+    if (idOut) memcpy(idOut, id, 5);
+    int strings = 0, vectors = 0, others = 0;
+    for (int i = 0; i < count; i++) {
+        std::string tn = TypeName(mi->parameters[i]);
+        Class pc(mi->parameters[i]);
+        auto *k = pc.IsValid() ? pc.GetClass() : nullptr;
+        void *v = nullptr;
+        if (tn == "System.String") {
+            if (strings == 0) v = CreateMonoString(id);
+            else if (strings == 1) v = CreateMonoString(key);
+            strings++;                                   // later strings stay null
+        } else if (tn == "UnityEngine.Vector3") {
+            Vector3 vec = vectors == 0 ? pos : vectors == 1 ? vel : Vector3(0, 0, 0);
+            vectors++;
+            v = G.valueBox(k, &vec);
+        } else if (tn == "UnityEngine.Quaternion") {
+            v = G.valueBox(k, &rot);
+        } else if (tn == "System.String[]") {
+            v = G.arrayNew(G.stringClass, 0);
+        } else if (k && k->byval_arg.valuetype) {
+            uint8_t raw[64] = {};
+            raw[0] = 1;                                 // spawn kind 1 / the two bytes = 1
+            // Photon can't send the game's enum types, only plain numbers (like the kit's
+            // Int32 1), so an enum goes as its underlying number type.
+            auto *boxAs = k->enumtype && k->element_class ? k->element_class : k;
+            v = G.valueBox(boxAs, raw);
+            others++;
+        }
+        Put(args, i, v);
+    }
+    static bool loggedTypes = false;
+    if (!loggedTypes) {                                   // once: what the game expects, for fixing
+        loggedTypes = true;
+        std::string sig;
+        for (int i = 0; i < mi->parameters_count; i++) {
+            Class pc(mi->parameters[i]);
+            auto *k = pc.IsValid() ? pc.GetClass() : nullptr;
+            std::string tn = TypeName(mi->parameters[i]);
+            if (tn.size() > 30) tn = k && k->byval_arg.valuetype ? (k->enumtype ? "enum" : "struct" + std::to_string(k->instance_size - 16)) : "class";
+            sig += (i ? "," : "") + tn;
+        }
+        ym::log("clientdabell: item message takes %s", sig.c_str());
+    }
+    try {
+        G.pvRpc[pv](CreateMonoString("RpcCreateItem"), 0, args);      // 0 = everyone in the room
+    } catch (BNM::IL2CPP::Il2CppExceptionWrapper &w) {   // the game said no: log why, don't crash the menu
+        auto *ex = w.ex;
+        auto *msg = ex ? (BNM::Structures::Mono::String *)ex->message : nullptr;
+        auto *cls = ex ? (BNM::Structures::Mono::String *)ex->className : nullptr;
+        ym::log("clientdabell: item message error %s: %s", cls ? cls->str().c_str() : "?", msg ? msg->str().c_str() : "?");
+        return false;
+    }
+    return true;
+}
+
+static void QueueItems(const std::vector<PendingItem> &list) {
+    if (!g_itemKey[0]) return;
+    if (g_time < g_nextBatch) { Notify("Wait a moment"); return; }
+    g_nextBatch = g_time + 3.0;
+    for (auto &p : list) if (g_itemQueue.size() < 32) g_itemQueue.push_back(p);
+}
+
+static void ItemQueueTick() {
+    for (int sent = 0; sent < 2 && !g_itemQueue.empty(); sent++) {   // 2 a frame at most
+        PendingItem p = g_itemQueue.front();
+        g_itemQueue.erase(g_itemQueue.begin());
+        bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel);
+        static int logged = 0;
+        if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
+        if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
+    }
+}
+
+// A grid in front of you: w across, d deep, h high. Never more than 27 in one batch (AGENTS.md),
+// and QueueItems adds the 3 second cooldown and the cap on how many wait.
+static void SpawnGridDims(int w, int d, int h) {
+    Il2CppObject *head = g_head.get();
+    if (!head || w < 1 || d < 1 || h < 1 || w * d * h > 27) return;
+    Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
+    Vector3 base = G.trGetPosition[head]() + f * 1.2f + Vector3(0, -0.4f, 0);
+    std::vector<PendingItem> list;
+    for (int y = 0; y < h; y++)
+        for (int z = 0; z < d; z++)
+            for (int x = 0; x < w; x++)
+                list.push_back({base + r * ((x - (w - 1) * 0.5f) * 0.45f) + f * (z * 0.45f) + Vector3(0, y * 0.45f, 0), Vector3(0, 0, 0)});
+    QueueItems(list);
+}
+static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   // 3x3 or 3x3x3
+// The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
+// whatever is in your left hand when you press). One scene search per press.
+static bool LeftHandItem() {
+    Il2CppObject *hand = g_leftHand.get();
+    if (!hand || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return false;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                  : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    Vector3 hp = G.trGetPosition[hand]();
+    Il2CppObject *best = nullptr;
+    float bestD = 0.4f * 0.4f;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it) || (G.itemHeld.IsValid() && !G.itemHeld[it]())) continue;
+        Vector3 d = G.trGetPosition[G.compTransform[it]()]() - hp;
+        float dd = d.x * d.x + d.y * d.y + d.z * d.z;
+        if (dd < bestD) { bestD = dd; best = it; }
+    }
+    auto *key = best ? G.itemKey[best]() : nullptr;
+    if (!key) { Notify("Hold an item in your left hand"); return false; }
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    return true;
+}
+static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
+static void ArmDupe27() { if (LeftHandItem()) SpawnGrid(27); }
+static void ArmDupe9x3() { if (LeftHandItem()) SpawnGridDims(9, 3, 1); }   // 27 in a row of 9, three deep
+
+// Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
+static bool g_onHandTrigger = false;
+static void SpawnOnHandTick(const Buttons &in) {
+    bool press = in.rtrig && !g_onHandTrigger;
+    g_onHandTrigger = in.rtrig;
+    Il2CppObject *hand = g_rightHand.get();
+    if (!f_spawnOnHand || !press || in.rgrip || g_menuShown || !hand || g_time < g_nextItem) return;
+    if (!LeftHandItem()) return;
+    g_nextItem = g_time + 0.3;
+    g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
+}
+
+// ---- soundboard: songs you copy onto the headset ----------------------------------------
+// Put .wav files in a folder named "sounds" next to the .so files in the mods folder
+// (Android/data/com.TrassGames.Yeeps/files/mods/sounds/). Open Soundboard, pick a song, press
+// Play. Only you hear it: it plays on an audio source on your head, nothing is sent.
+// WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
+// the game never stalls, and mixed down to mono to save memory.
+static constexpr int kMaxSongs = 64;
+static constexpr uint64_t kMaxFrames = 12000000;       // about 4.5 minutes at 44.1 kHz
+static constexpr uint32_t kChunkFrames = 32768;        // frames read per game frame
+static std::vector<std::string> g_songs;
+static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
+static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
+static const char *kSoundVolNames[] = {"quiet", "medium", "loud"};
+static Ref g_audioGo, g_audioSrc, g_clip, g_chunk;
+
+struct Loader {
+    FILE *f = nullptr;
+    int channels = 0, bits = 0, fmt = 0;               // fmt 1 = whole numbers, 3 = floating point
+    uint32_t rate = 0, block = 0;
+    uint64_t frames = 0, done = 0;
+    int song = -1, lastTen = -1;
+    bool playWhenDone = false;
+    std::vector<uint8_t> buf;
+} g_load;
+
+static uint32_t U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t U16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static std::string SongsDir() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : "") + "/sounds";
+}
+static std::string SongTitle(int i) {
+    if (i < 0 || i >= (int)g_songs.size()) return "";
+    std::string n = g_songs[i];
+    return n.size() > 4 ? n.substr(0, n.size() - 4) : n;
+}
+static void UpdateSoundLabel() {
+    if (g_songs.empty()) snprintf(g_soundLabel, sizeof g_soundLabel, "Play: (no songs)");
+    else snprintf(g_soundLabel, sizeof g_soundLabel, "Play %d/%d: %.14s", g_songSel + 1, (int)g_songs.size(), SongTitle(g_songSel).c_str());
+    g_dirty = true;
+}
+static void ScanSongs() {
+    g_songs.clear();
+    g_songSel = 0;
+    std::string dir = SongsDir();
+    DIR *d = opendir(dir.c_str());
+    if (!d) {
+        ym::log("clientdabell: no sounds folder at %s", dir.c_str());
+        UpdateSoundLabel();
+        Notify("Make a folder called sounds in your mods folder");
+        return;
+    }
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".wav") == 0 && (int)g_songs.size() < kMaxSongs) g_songs.push_back(n);
+    }
+    closedir(d);
+    std::sort(g_songs.begin(), g_songs.end());
+    UpdateSoundLabel();
+    ym::log("clientdabell: found %d songs", (int)g_songs.size());
+    Notify(g_songs.empty() ? "No .wav files in the sounds folder" : "%d songs found", (int)g_songs.size());
+}
+
+// Reads the WAV header and leaves the file positioned at the first sample.
+static bool OpenWav(const std::string &path, Loader &L, const char **err) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) { *err = "Couldn't open that file"; return false; }
+    uint8_t h[12];
+    if (fread(h, 1, 12, f) != 12 || memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) {
+        fclose(f); *err = "That isn't a WAV file"; return false;
+    }
+    bool haveFmt = false, haveData = false;
+    uint32_t dataBytes = 0;
+    long dataStart = 0;
+    uint8_t ch[8];
+    while (fread(ch, 1, 8, f) == 8) {
+        uint32_t size = U32(ch + 4);
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            uint8_t fm[40] = {};
+            size_t n = size < 40 ? size : 40;
+            if (fread(fm, 1, n, f) != n || n < 16) break;
+            L.fmt = U16(fm);
+            L.channels = U16(fm + 2);
+            L.rate = U32(fm + 4);
+            L.bits = U16(fm + 14);
+            if (L.fmt == 0xFFFE && n >= 26) L.fmt = U16(fm + 24);     // "extensible": real format inside
+            haveFmt = true;
+            if (size > n || (size & 1)) fseek(f, (long)(size - n) + (long)(size & 1), SEEK_CUR);
+        } else if (memcmp(ch, "data", 4) == 0) {
+            dataBytes = size;
+            dataStart = ftell(f);
+            haveData = true;
+            break;
+        } else {
+            fseek(f, (long)size + (long)(size & 1), SEEK_CUR);
+        }
+    }
+    if (!haveFmt || !haveData) { fclose(f); *err = "Couldn't read that WAV"; return false; }
+    bool okFmt = (L.fmt == 1 && (L.bits == 8 || L.bits == 16 || L.bits == 24 || L.bits == 32)) || (L.fmt == 3 && L.bits == 32);
+    if (!okFmt || L.channels < 1 || L.channels > 8 || L.rate < 8000 || L.rate > 192000) {
+        fclose(f); *err = "Unsupported WAV (use 16-bit PCM)"; return false;
+    }
+    L.block = (uint32_t)L.channels * (uint32_t)(L.bits / 8);
+    fseek(f, 0, SEEK_END);
+    long fileEnd = ftell(f);
+    if (dataBytes == 0 || dataBytes == 0xFFFFFFFFu || dataStart + (long)dataBytes > fileEnd) dataBytes = (uint32_t)(fileEnd - dataStart);
+    fseek(f, dataStart, SEEK_SET);
+    L.frames = dataBytes / L.block;
+    L.f = f;
+    return true;
+}
+
+static void AbortLoad() {
+    if (g_load.f) fclose(g_load.f);
+    g_load.f = nullptr;
+    g_load.buf.clear();
+    g_load.buf.shrink_to_fit();
+    g_chunk.clear();
+}
+
+static bool EnsureAudioSource() {
+    if (Alive(g_audioGo.get()) && Alive(g_audioSrc.get())) return true;
+    if (!G.tAudioSource || !G.asPlay.IsValid() || !G.asSetClip.IsValid() || !g_head.get()) return false;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellAudio"));
+    Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+    if (!src) return false;
+    Il2CppObject *t = Tr(go);
+    G.trSetParent[t](g_head.get(), false);
+    G.trSetLocalPosition[t](Vector3(0, 0, 0));
+    g_audioGo.set(go);
+    g_audioSrc.set(src);
+    return true;
+}
+
+static void PlayLoaded() {
+    if (!EnsureAudioSource() || !Alive(g_clip.get())) { Notify("Couldn't start the sound"); return; }
+    Il2CppObject *src = g_audioSrc.get();
+    G.asSetClip[src](g_clip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+    G.asPlay[src]();
+    Notify("Playing %.30s", SongTitle(g_clipSong).c_str());
+}
+
+static void StartLoad(int song, bool playAfter) {
+    if (!G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) {
+        ym::log("clientdabell: soundboard missing: create=%d setdata=%d array=%d", G.audioClipCreate.IsValid(), G.audioClipSetData.IsValid(), G.arrayNew != nullptr);
+        Notify("Soundboard isn't available in this game");
+        return;
+    }
+    Loader L;
+    const char *err = "";
+    if (!OpenWav(SongsDir() + "/" + g_songs[song], L, &err)) { Notify("%s", err); return; }
+    if (L.frames == 0) { fclose(L.f); Notify("That song is empty"); return; }
+    if (L.frames > kMaxFrames) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
+    g_clip.clear();
+    g_clipSong = -1;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.frames, 1, (int)L.rate, false);
+    Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
+    if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
+    g_clip.set(clip);
+    g_chunk.set(chunk);
+    L.buf.resize((size_t)kChunkFrames * L.block);
+    L.song = song;
+    L.playWhenDone = playAfter;
+    g_load = std::move(L);
+    ym::log("clientdabell: loading %s (%llu frames, %d ch, %d bit, %u Hz)", g_songs[song].c_str(), (unsigned long long)g_load.frames,
+            g_load.channels, g_load.bits, g_load.rate);
+    Notify("Loading %.30s", SongTitle(song).c_str());
+}
+
+// Called every frame: reads the next slice of the song into the clip (about 32k frames).
+static void LoadTick() {
+    Loader &L = g_load;
+    if (!L.f) return;
+    Il2CppObject *clip = g_clip.get();
+    if (!Alive(clip)) { AbortLoad(); return; }
+    uint64_t want = L.frames - L.done < kChunkFrames ? L.frames - L.done : kChunkFrames;
+    size_t got = fread(L.buf.data(), 1, (size_t)(want * L.block), L.f);
+    uint64_t n = got / L.block;
+    if (n > 0) {
+        Il2CppObject *arr = n == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+        if (!arr) { AbortLoad(); Notify("Not enough memory for that song"); return; }
+        float *dst = (float *)((uint8_t *)arr + 0x20);
+        const int bytes = L.bits / 8;
+        const float inv = 1.0f / (float)L.channels;
+        for (uint64_t i = 0; i < n; i++) {
+            const uint8_t *p = L.buf.data() + i * L.block;
+            float sum = 0;
+            for (int c = 0; c < L.channels; c++) {
+                const uint8_t *q = p + c * bytes;
+                float v;
+                if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
+                else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
+                else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
+                else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
+                else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
+                sum += v;
+            }
+            dst[i] = sum * inv;
+        }
+        G.audioClipSetData[clip](arr, (int)L.done);
+        L.done += n;
+        int ten = (int)(L.done * 10 / L.frames);
+        if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+    }
+    if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
+        bool play = L.playWhenDone;
+        int song = L.song;
+        AbortLoad();
+        g_clipSong = song;
+        if (play) PlayLoaded();
+    }
+}
+
+static void PlaySong() {
+    if (g_songs.empty()) { Notify("Put .wav files in the sounds folder, then Rescan"); return; }
+    if (g_load.f) { Notify("Still loading, one moment"); return; }
+    if (g_clipSong == g_songSel && Alive(g_clip.get())) PlayLoaded();
+    else StartLoad(g_songSel, true);
+}
+static void NextSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void PrevSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + (int)g_songs.size() - 1) % (int)g_songs.size(); UpdateSoundLabel(); }
+static void StopSound() {
+    AbortLoad();
+    if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+}
+static void ApplyLoop() {
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+}
+static void NextSoundVolume() {
+    g_soundVol = (g_soundVol + 1) % 3;
+    Il2CppObject *src = g_audioSrc.get();
+    if (Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
+}
+
+// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
+// Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
+// head and is reused: a piece that lands, or drifts too far away, restarts above you. The
+// pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
+// the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
+// dim flash of light, and a thunder rumble that is made from noise in code, once.
+static constexpr int kMaxFx = 100;
+static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
+static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
+static int g_wxIntensity = 1;
+static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
+static Vector3 g_fxPos[kMaxFx];
+static float g_fxPhase[kMaxFx];
+static int g_fxMade = 0, g_fxMode = -1, g_fxShown = -1;
+static float g_groundY = 0;
+static double g_nextGround = 0, g_nextBolt = 0, g_boltHideAt = 0, g_flashAt = 0, g_thunderAt = 0;
+static bool g_wxOn = false;
+static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
+
+static void WeatherPicked() {
+    int picked = -1;
+    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
+    g_wx = picked;
+}
+static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
+
+static bool EnsureWxRoot() {
+    if (Alive(g_wxRoot.get())) return true;
+    Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellWeather"));
+    if (!go) return false;
+    g_wxRoot.set(go);
+    return true;
+}
+static void RespawnFx(int i, Vector3 head, bool anywhere) {
+    float a = Rand01() * 6.2831853f, r = 4.0f * sqrtf(Rand01());
+    float top = head.y + 3.0f;
+    float y = anywhere ? g_groundY + Rand01() * (top - g_groundY) : head.y + 2.0f + Rand01() * 1.5f;
+    g_fxPos[i] = Vector3(head.x + cosf(a) * r, y, head.z + sinf(a) * r);
+    g_fxPhase[i] = Rand01() * 6.2831853f;
+}
+static void StyleFx(int i, int mode) {
+    Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
+    if (!Alive(o) || !t) return;
+    if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
+    else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
+}
+
+// Thunder: low-passed noise with a quick attack and a long tail, plus a low thump.
+static void BuildThunderClip() {
+    if (Alive(g_wxClip.get()) || !G.audioClipCreate.IsValid() || !G.audioClipSetData.IsValid() || !G.arrayNew || !G.floatClass) return;
+    const int rate = 22050, n = rate * 3;
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString("ClientDaBellThunder"), n, 1, rate, false);
+    Il2CppObject *arr = (Il2CppObject *)G.arrayNew(G.floatClass, n);
+    if (!clip || !arr) return;
+    float *d = (float *)((uint8_t *)arr + 0x20);
+    float lp = 0, lp2 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / rate, noise = Rand01() * 2 - 1;
+        lp += (noise - lp) * 0.04f;
+        lp2 += (lp - lp2) * 0.15f;
+        float env = t < 0.04f ? t / 0.04f : expf(-(t - 0.04f) * 1.3f);
+        float crack = t < 0.5f ? noise * 0.25f * expf(-t * 9.0f) : 0.0f;
+        float thump = sinf(6.2831853f * 48.0f * t) * 0.35f * expf(-t * 1.8f);
+        float v = (lp2 * 4.0f + thump * 0.7f + crack * 0.7f) * env;
+        d[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    }
+    G.audioClipSetData[clip](arr, 0);
+    g_wxClip.set(clip);
+}
+static void PlayThunder() {
+    if (!Alive(g_wxClip.get()) || !G.tAudioSource || !G.asPlay.IsValid() || !g_head.get()) return;
+    if (!Alive(g_wxAudioGo.get()) || !Alive(g_wxAudioSrc.get())) {
+        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellThunderAudio"));
+        Il2CppObject *src = go ? G.goAddComponent[go](G.tAudioSource) : nullptr;
+        if (!src) return;
+        G.trSetParent[Tr(go)](g_head.get(), false);
+        G.trSetLocalPosition[Tr(go)](Vector3(0, 0, 0));
+        g_wxAudioGo.set(go);
+        g_wxAudioSrc.set(src);
+    }
+    Il2CppObject *src = g_wxAudioSrc.get();
+    G.asSetClip[src](g_wxClip.get());
+    if (G.asSetVolume.IsValid()) G.asSetVolume[src](kSoundVols[g_soundVol]);
+    if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);
+    if (G.asSetLoop.IsValid()) G.asSetLoop[src](false);
+    G.asPlay[src]();
+}
+static void EnsureStorm() {
+    if (!EnsureWxRoot()) return;
+    if (!Alive(g_wxLight.get())) {
+        Class light("UnityEngine", "Light");
+        Il2CppObject *go = light.IsValid() ? Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellLightning")) : nullptr;
+        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
+        if (l) {
+            g_lightType = light.GetMethod("set_type", 1);
+            g_lightIntensity = light.GetMethod("set_intensity", 1);
+            g_lightRange = light.GetMethod("set_range", 1);
+            g_lightColor = light.GetMethod("set_color", 1);
+            G.trSetParent[Tr(go)](Tr(g_wxRoot.get()), false);
+            if (g_lightType.IsValid()) g_lightType[l](2);                     // a point light
+            if (g_lightRange.IsValid()) g_lightRange[l](80.0f);
+            if (g_lightColor.IsValid()) g_lightColor[l](Color(0.8f, 0.85f, 1.0f, 1));
+            if (g_lightIntensity.IsValid()) g_lightIntensity[l](0.0f);
+            G.behaviourSetEnabled[l](false);
+            g_wxLight.set(l);
+        }
+    }
+    for (int i = 0; i < 7; i++) {
+        if (Alive(g_bolt[i].get())) continue;
+        Il2CppObject *o = Prim(3, Color(0.92f, 0.95f, 1.0f, 1), false);
+        if (!o) continue;
+        G.trSetParent[Tr(o)](Tr(g_wxRoot.get()), false);
+        G.goSetActive[o](false);
+        g_bolt[i].set(o);
+    }
+    BuildThunderClip();
+}
+static void StrikeBolt(Vector3 head) {
+    float ang = Rand01() * 6.2831853f, dist = 25.0f + Rand01() * 30.0f;
+    Vector3 base(head.x + cosf(ang) * dist, g_groundY, head.z + sinf(ang) * dist), pts[8];
+    float jx = 0, jz = 0;
+    for (int i = 0; i < 8; i++) {                       // a jagged line from the sky to the ground
+        float k = i / 7.0f;
+        if (i > 0 && i < 7) { jx += (Rand01() - 0.5f) * 7.0f; jz += (Rand01() - 0.5f) * 7.0f; }
+        pts[i] = Vector3(base.x + jx * (1 - k), base.y + (1 - k) * 45.0f, base.z + jz * (1 - k));
+    }
+    for (int i = 0; i < 7; i++) {
+        Il2CppObject *o = g_bolt[i].get();
+        if (!Alive(o)) continue;
+        Vector3 dv = pts[i + 1] - pts[i], mid = (pts[i] + pts[i + 1]) * 0.5f;
+        float len = sqrtf(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+        if (len < 0.01f) continue;
+        Il2CppObject *t = Tr(o);
+        G.trSetPosition[t](mid);
+        G.trSetRotation[t](Quaternion::LookRotation(dv));
+        G.trSetLocalScale[t](Vector3(0.8f, 0.8f, len));
+        G.goSetActive[o](true);
+    }
+    g_boltHideAt = g_time + 0.22;
+    g_flashAt = g_time;
+    g_thunderAt = g_time + 0.4 + dist * 0.02;
+}
+static void HideBolt() {
+    for (int i = 0; i < 7; i++) Show(g_bolt[i], false);
+}
+static void StormTick(Vector3 hp) {
+    EnsureStorm();
+    if (g_nextBolt == 0) g_nextBolt = g_time + 2.0 + Rand01() * 3.0;
+    if (g_time >= g_nextBolt && Alive(g_bolt[0].get())) {
+        StrikeBolt(hp);
+        g_nextBolt = g_time + 5.0 + Rand01() * 7.0;               // one strike every 5-12 seconds
+    }
+    if (g_boltHideAt > 0 && g_time >= g_boltHideAt) { HideBolt(); g_boltHideAt = 0; }
+    Il2CppObject *l = g_wxLight.get();
+    if (Alive(l) && g_lightIntensity.IsValid()) {              // a dim flash that fades, with a small flicker
+        float t = (float)(g_time - g_flashAt);
+        float k = g_flashAt > 0 && t < 0.4f ? 1.0f - t / 0.4f : 0.0f;
+        if (t > 0.12f && t < 0.2f) k *= 0.3f;
+        G.behaviourSetEnabled[l](k > 0);
+        if (k > 0) {
+            G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(0, 5.0f, 0));
+            g_lightIntensity[l](9.0f * k);
+        }
+    }
+    if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
+}
+
+static void WeatherOff() {
+    g_wxOn = false;
+    g_fxMode = -1;
+    g_nextBolt = 0;
+    g_thunderAt = 0;
+    g_boltHideAt = 0;
+    g_flashAt = 0;
+    Show(g_wxRoot, false);                                     // hides every piece; they are reused next time
+    if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
+    if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
+    HideBolt();
+}
+static void WeatherReset() {                                   // room change: the old objects are gone
+    Kill(g_wxRoot);
+    Kill(g_wxAudioGo);
+    Kill(g_wxClip);
+    for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
+    for (int i = 0; i < 7; i++) g_bolt[i].clear();
+    g_wxLight.clear();
+    g_wxAudioSrc.clear();
+    g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
+    g_nextBolt = g_thunderAt = g_boltHideAt = g_flashAt = 0;
+    g_wxOn = false;
+}
+
+static void WeatherTick(float dt) {
+    int mode = (g_wx >= 0 && g_wxSel[g_wx]) ? g_wx : -1;
+    Il2CppObject *head = g_head.get();
+    if (mode < 0 || !head) { if (g_wxOn) WeatherOff(); return; }
+    if (!EnsureWxRoot()) return;
+    if (!g_wxOn) { g_wxOn = true; Show(g_wxRoot, true); }
+    Vector3 hp = G.trGetPosition[head]();
+    if (g_time >= g_nextGround) {                              // ground height, four times a second
+        g_nextGround = g_time + 0.25;
+        int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : -5;
+        BNM::Structures::Unity::RaycastHit hit{};
+        bool found = G.raycast.IsValid() && G.raycast(hp, Vector3(0, -1, 0), &hit, 8.0f, mask ? mask : -5);
+        g_groundY = found ? hit.point.y : hp.y - 2.5f;
+    }
+    int want = kFxCounts[mode][g_wxIntensity];
+    for (int n = 0; n < 25 && g_fxMade < kMaxFx; n++) {        // make the pool a few pieces per frame
+        Il2CppObject *o = Prim(3, Color(1, 1, 1, 1), false);
+        if (!o) break;
+        int i = g_fxMade++;
+        Il2CppObject *t = Tr(o);
+        G.trSetParent[t](Tr(g_wxRoot.get()), false);
+        g_fx[i].set(o);
+        g_fxT[i].set(t);
+        StyleFx(i, mode);
+        RespawnFx(i, hp, true);
+        G.goSetActive[o](i < want);
+    }
+    if (g_fxMade == 0) return;
+    if (mode != g_fxMode) {                                    // switched effect: restyle and refill the air
+        g_fxMode = mode;
+        for (int i = 0; i < g_fxMade; i++) { StyleFx(i, mode); RespawnFx(i, hp, true); }
+        g_fxShown = -1;
+    }
+    if (want != g_fxShown) {
+        for (int i = 0; i < g_fxMade; i++) if (Alive(g_fx[i].get())) G.goSetActive[g_fx[i].get()](i < want);
+        g_fxShown = want;
+    }
+    int active = std::min(want, g_fxMade);
+    float t = (float)g_time;
+    for (int i = 0; i < active; i++) {
+        Vector3 &p = g_fxPos[i];
+        if (mode == 0) {                                       // snow: slow, swaying
+            p.y -= 1.1f * dt;
+            p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
+            p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
+        } else {                                               // rain: fast, a little wind
+            p.y -= 9.0f * dt;
+            p.x += 0.6f * dt;
+        }
+        float dx = p.x - hp.x, dz = p.z - hp.z;
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
+        if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
+    }
+    if (mode == 2) StormTick(hp);
+    else { HideBolt(); g_nextBolt = 0; }
+}
+
+// ---- Overpowered (all of it changes only your own body; nothing is sent) ---------------
+// Very Long Arms moves your own hands, like the dances do, so the room sees the long arms
+// the way it sees any pose: the game sends your hands as usual and nothing extra goes out.
+static const float kArmScales[] = {1.5f, 2.0f, 3.0f, 4.0f};
+static int g_armScale = 1;
+static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %.1fx", kArmScales[g_armScale]); }
+
+// To stretch an arm the controller trackers have to be paused (they would put the hand back),
+// so the real controller position is read from the headset's input instead. That position is
+// in the space of one of the hand's parents; the first frames check which one by comparing
+// with where the hand really is. If nothing matches, Very Long Arms switches itself off.
+static int g_laState = 0;                      // 0 starting, 1 checking, 2 working, 3 not supported
+static int g_laChecks = 0, g_laSpaceL = -1, g_laSpaceR = -1;
+static bool g_laOwns = false, g_laInit = false;
+static double g_laNextPause = 0;
+// Where the controller position comes from. This game build hides the XR feature-value reader, so
+// try the older XR calls and the Oculus ones; whichever exists is used (and logged once).
+static int g_laProv = 0;                       // 0 none, 1 XR InputTracking, 2 OVRInput
+static Method<Vector3> g_provPos;
+static Method<Quaternion> g_provRot;
+static void LongArmsToggled() { g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; }
+
+static bool LaInit() {
+    if (g_laInit) return g_laProv != 0;
+    g_laInit = true;
+    Class it("UnityEngine.XR", "InputTracking");
+    if (it.IsValid()) {
+        g_provPos = it.GetMethod("GetLocalPosition", 1);
+        g_provRot = it.GetMethod("GetLocalRotation", 1);
+        if (g_provPos.IsValid() && g_provRot.IsValid()) g_laProv = 1;
+    }
+    if (!g_laProv) {
+        Class ov("", "OVRInput");
+        if (ov.IsValid()) {
+            g_provPos = ov.GetMethod("GetLocalControllerPosition", 1);
+            g_provRot = ov.GetMethod("GetLocalControllerRotation", 1);
+            if (g_provPos.IsValid() && g_provRot.IsValid()) g_laProv = 2;
+        }
+    }
+    ym::log("clientdabell: long arms controller source: %s", g_laProv == 1 ? "XR InputTracking" : g_laProv == 2 ? "OVRInput" : "none");
+    return g_laProv != 0;
+}
+// The controller's real position and rotation in the world, as one of the hand's parents sees it.
+static bool ReadController(int node, Il2CppObject *hand, int &space, Vector3 &pos, Quaternion &rot) {
+    int arg = g_laProv == 1 ? node : (node == 4 ? 1 : 2);        // XRNode 4/5, or OVRInput.Controller LTouch/RTouch
+    Vector3 lp = g_provPos(arg);
+    Quaternion lr = g_provRot(arg);
+    Il2CppObject *a = G.trGetParent[hand]();
+    Vector3 handPos = G.trGetPosition[hand]();
+    int best = -1;
+    float bestErr = 0.10f;
+    for (int k = 0; k < 3 && a; k++, a = G.trGetParent[a]()) {
+        if (space >= 0 && k != space) continue;
+        Vector3 w = G.trTransformPoint[a](lp), e = w - handPos;
+        float err = sqrtf(Dot(e, e));
+        if (space >= 0 || err < bestErr) { best = k; bestErr = err; pos = w; rot = G.trGetRotation[a]() * lr; }
+        if (space >= 0) break;
+    }
+    if (best < 0) return false;
+    if (space < 0) space = best;
+    return true;
+}
+// Stretch mode needs the trackers to place the hands during Update (before this mod runs), not just
+// before rendering, or they would move the hands back after every stretch. Done once per room.
+static bool g_laTrackersSet = false;
+static void SetTrackersToUpdate() {
+    if (g_laTrackersSet || !G.trGetParent.IsValid()) return;
+    g_laTrackersSet = true;
+    int found = 0, changed = 0;
+    for (auto nc : std::vector<std::tuple<const char *, const char *, const char *>>{
+             {"UnityEngine.XR.Interaction.Toolkit", "XRBaseController", "set_updateTrackingType"},
+             {"UnityEngine.InputSystem.XR", "TrackedPoseDriver", "set_updateType"},
+             {"UnityEngine.SpatialTracking", "TrackedPoseDriver", "set_updateType"}}) {
+        Class c(std::get<0>(nc), std::get<1>(nc));
+        if (!c.IsValid()) continue;
+        Method<void> setter = c.GetMethod(std::get<2>(nc), 1);
+        for (Il2CppObject *t : {g_leftHand.get(), g_rightHand.get()})
+            for (int up = 0; up < 3 && t; up++, t = G.trGetParent[t]()) {
+                Il2CppObject *go = G.compGameObject[t]();
+                Il2CppObject *comp = go ? G.goGetComponent[go]((Il2CppObject *)c.GetMonoType()) : nullptr;
+                if (!comp) continue;
+                found++;
+                if (setter.IsValid()) { setter[comp](0); changed++; }
+            }
+    }
+    ym::log("clientdabell: long arms stretch: %d trackers found, %d set to Update", found, changed);
+}
+static bool g_laStretch = false;               // fallback: stretch the hand from where the trackers just put it
+static void LongArmsFail(const char *why) {
+    g_laState = 3;
+    if (g_laOwns && !g_dancing) PauseTrackers(false);
+    g_laOwns = false;
+    f_longArms = false;
+    g_dirty = true;
+    ym::log("clientdabell: long arms off: %s", why);
+    Notify("Long Arms isn't supported here");
+}
+static void LongArmsTick() {
+    Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    bool want = f_longArms && !g_menuShown && !g_dancing && head && lh && rh;
+    if (!want) {
+        if (g_laOwns && !g_dancing) { PauseTrackers(false); g_laOwns = false; }   // the menu and the dances need normal hands
+        if (!f_longArms) g_laState = 0;
+        return;
+    }
+    Vector3 pl, pr;
+    Quaternion ql, qr;
+    if (!g_laStretch && (!LaInit() || !G.trTransformPoint.IsValid() || !G.trGetParent.IsValid() || !G.trGetRotation.IsValid())) {
+        g_laStretch = true;
+        ym::log("clientdabell: long arms: controller input not available, using stretch mode");
+    }
+    if (g_laStretch) {                                             // the trackers place the hands each frame; push them outward from the chest
+        SetTrackersToUpdate();
+        Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+        float k = kArmScales[g_armScale];
+        static int logged = 0;
+        for (Il2CppObject *h : {lh, rh}) {
+            Vector3 before = G.trGetPosition[h]();
+            G.trSetPosition[h](chest + (before - chest) * k);
+            if (logged < 4) { Vector3 after = G.trGetPosition[h](); ym::log("clientdabell: stretch hand %.2f,%.2f,%.2f -> %.2f,%.2f,%.2f", before.x, before.y, before.z, after.x, after.y, after.z); logged++; }
+        }
+        return;
+    }
+    if (g_laState < 2) {                                           // trackers still on: find out how to read the controllers
+        bool okL = ReadController(4, lh, g_laSpaceL, pl, ql), okR = ReadController(5, rh, g_laSpaceR, pr, qr);
+        if (okL && okR) { g_laState = 2; ym::log("clientdabell: long arms ready (spaces %d/%d)", g_laSpaceL, g_laSpaceR); }
+        else if (++g_laChecks > 60) { g_laStretch = true; ym::log("clientdabell: long arms: controller positions don't match the hands, using stretch mode"); }
+        return;
+    }
+    if (g_pausedN == 0 && g_time >= g_laNextPause) {               // pause the trackers (retry twice a second)
+        g_laNextPause = g_time + 0.5;
+        PauseTrackers(true);
+        g_laOwns = g_pausedN > 0;
+        if (!g_laOwns) ym::log("clientdabell: long arms: couldn't pause the hand trackers");
+    }
+    if (!ReadController(4, lh, g_laSpaceL, pl, ql) || !ReadController(5, rh, g_laSpaceR, pr, qr)) return;
+    Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
+    float k = kArmScales[g_armScale];
+    G.trSetPosition[lh](chest + (pl - chest) * k);
+    G.trSetRotation[lh](ql);
+    G.trSetPosition[rh](chest + (pr - chest) * k);
+    G.trSetRotation[rh](qr);
+}
+
+// Mega Jump: press B (Y if the menu is on your right hand) for a jump of any power, in the air too.
+static const float kJumpPowers[] = {6.0f, 10.0f, 16.0f, 24.0f};
+static const char *kJumpNames[] = {"small", "medium", "big", "huge"};
+static int g_jumpPower = 1;
+static bool g_megaPrev = false;
+static double g_nextMega = 0;
+static void NextJumpPower() { g_jumpPower = (g_jumpPower + 1) % 4; Notify("Jump power: %s", kJumpNames[g_jumpPower]); }
+static void MegaJumpTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.y : in.b, press = btn && !g_megaPrev;
+    g_megaPrev = btn;
+    Vector3 v;
+    if (!f_megaJump || !press || g_menuShown || g_time < g_nextMega || !GetVel(v)) return;
+    g_nextMega = g_time + 0.25;
+    SetVel(Vector3(v.x, kJumpPowers[g_jumpPower], v.z));
+}
+
+// Super Fly: like Velocity Fly, but along your head, and a lot faster.
+static void SuperFlyTick(const Buttons &in) {
+    Il2CppObject *head = g_head.get(), *player = g_player.get();
+    if (!f_superFly || !in.a || !head || !player) return;
+    SetVel(G.trGetForward[head]() * 35.0f);
+    if (G.plNoGravityFor.IsValid()) G.plNoGravityFor[player](0.1f);
+}
+
+// Rocket Boots: hold both triggers and you climb, keeping your sideways speed.
+static void RocketTick(const Buttons &in, float dt) {
+    Vector3 v;
+    if (!f_rocket || !in.ltrig || !in.rtrig || !GetVel(v)) return;
+    v.y += 30.0f * dt;
+    if (v.y > 14.0f) v.y = 14.0f;
+    SetVel(v);
+    if (G.plNoGravityFor.IsValid() && g_player.get()) G.plNoGravityFor[g_player.get()](0.1f);
+}
+
+// Ground Pound (mace style): press both grips to slam straight down. The harder the fall, the
+// bigger the smash: on landing a shockwave ring spreads out from your feet and you bounce back up.
+// All of it is only on your own screen and your own body.
+static bool g_poundPrev = false, g_pounding = false;
+static double g_poundStart = 0, g_ringStart = -1;
+static float g_poundTopY = 0, g_ringPower = 1;
+static Vector3 g_ringAt;
+static Ref g_ring[2];
+static void RingTick() {
+    if (g_ringStart < 0) return;
+    float t = (float)(g_time - g_ringStart) / 0.55f;
+    if (t >= 1) { g_ringStart = -1; for (auto &r : g_ring) Show(r, false); return; }
+    for (int i = 0; i < 2; i++) {
+        Il2CppObject *o = g_ring[i].get();
+        if (!Alive(o)) continue;
+        float tt = t - i * 0.12f;
+        bool vis = tt > 0;
+        Show(g_ring[i], vis);
+        if (!vis) continue;
+        float e = 1 - (1 - tt) * (1 - tt);
+        float r = (1.0f + 6.0f * g_ringPower * e) * 2;             // diameter
+        float th = 0.06f * (1 - tt) + 0.005f;
+        Il2CppObject *tr = Tr(o);
+        G.trSetPosition[tr](g_ringAt + Vector3(0, 0.03f + i * 0.03f, 0));
+        G.trSetLocalScale[tr](Vector3(r, th, r));
+        SetColor(o, i ? Color(1.0f, 0.85f, 0.4f, 1) : Color(1.0f, 1.0f, 1.0f, 1));
+    }
+}
+static void GroundPoundTick(const Buttons &in) {
+    bool both = in.lgrip && in.rgrip, press = both && !g_poundPrev;
+    g_poundPrev = both;
+    RingTick();
+    Vector3 v, body;
+    if (!f_groundPound || !GetVel(v) || !BodyPos(body)) return;
+    if (press) {
+        g_pounding = true;
+        g_poundStart = g_time;
+        g_poundTopY = body.y;
+        SetVel(Vector3(0, -35.0f, 0));
+        return;
+    }
+    if (!g_pounding) return;
+    if (g_time - g_poundStart > 4.0) { g_pounding = false; return; }
+    if (g_time - g_poundStart < 0.12 || v.y > -6.0f) {
+        if (g_time - g_poundStart >= 0.12 && v.y > -6.0f) {        // landed
+            g_pounding = false;
+            float fall = g_poundTopY - body.y;
+            g_ringPower = fall < 1 ? 0.5f : fall > 12 ? 2.0f : 0.5f + 1.5f * (fall - 1) / 11;
+            g_ringAt = body;
+            BNM::Structures::Unity::RaycastHit hit{};
+            if (G.raycast.IsValid() && G.raycast(body, Vector3(0, -1, 0), &hit, 3.0f, -5)) g_ringAt = hit.point;
+            for (auto &r : g_ring)
+                if (!Alive(r.get())) {
+                    Il2CppObject *o = Prim(2, Color(1, 1, 1, 1), false);   // flat cylinder = a ring on the ground
+                    if (o) r.set(o);
+                }
+            g_ringStart = g_time;
+            SetVel(Vector3(v.x, 5.0f + 5.0f * g_ringPower, v.z));      // the bounce
+            Buzz();
+            Notify("SMASH!");
+        }
+    }
+}
+
+// Bounce: every hard landing sends you back up, a little lower each time (like a rubber ball).
+static float g_bounceVy = 0;
+static double g_bounceNext = 0;
+static void BounceTick() {
+    Vector3 v;
+    if (!f_bounce || !GetVel(v)) { g_bounceVy = 0; return; }
+    if (g_bounceVy < -4.0f && v.y > g_bounceVy * 0.3f && g_time >= g_bounceNext) {   // suddenly stopped falling
+        float up = -g_bounceVy * 0.85f;
+        up = up < 7.0f ? 7.0f : up > 30.0f ? 30.0f : up;
+        SetVel(Vector3(v.x, up, v.z));
+        g_bounceNext = g_time + 0.25;
+        v.y = up;
+    }
+    g_bounceVy = v.y;
+}
+
+// Fling Gun: press A (X if the menu is on your right hand) to launch yourself the way your free hand points.
+static bool g_flingPrev = false;
+static double g_flingNext = 0;
+static void FlingGunTick(const Buttons &in) {
+    bool btn = f_rightHand ? in.x : in.a, press = btn && !g_flingPrev;
+    g_flingPrev = btn;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    Vector3 v;
+    if (!f_flingGun || !press || g_menuShown || g_dance >= 0 || !hand || g_time < g_flingNext || !GetVel(v)) return;
+    g_flingNext = g_time + 0.4;
+    SetVel(G.trGetForward[hand]() * 32.0f);
+    Buzz();
+}
+
+// Launch Items Gun: squeeze the grip of your free hand to shoot colorful blocks and balls that fly,
+// bounce and fade. They are local props that only you see; real room items are never touched.
+static constexpr int kMaxShots = 24;
+struct Shot { Ref go; Vector3 pos, vel; double born = -1; };
+static Shot g_shots[kMaxShots];
+static int g_shotNext = 0;
+static bool g_shotPrev = false;
+static double g_shotCool = 0;
+static void ItemGunTick(const Buttons &in, float dt) {
+    bool grip = f_rightHand ? in.lgrip : in.rgrip, other = f_rightHand ? in.rgrip : in.lgrip;
+    bool press = grip && !other && !g_shotPrev;
+    g_shotPrev = grip;
+    Il2CppObject *hand = f_rightHand ? g_leftHand.get() : g_rightHand.get();
+    if (f_propGun && press && !g_menuShown && g_dance < 0 && hand && g_time >= g_shotCool && G.createPrimitive.IsValid()) {
+        g_shotCool = g_time + 0.2;
+        Shot &s = g_shots[g_shotNext];
+        g_shotNext = (g_shotNext + 1) % kMaxShots;
+        Kill(s.go);                                                // recycle the oldest
+        float h = fmodf((float)g_time * 0.37f, 1.0f);
+        Il2CppObject *o = Prim(g_shotNext % 2 ? 0 : 3, Rainbow(h), false);
+        if (o) {
+            G.trSetLocalScale[Tr(o)](Vector3(0.25f, 0.25f, 0.25f));
+            s.go.set(o);
+            Vector3 d = G.trGetForward[hand]();
+            s.pos = G.trGetPosition[hand]() + d * 0.3f;
+            s.vel = d * 22.0f;
+            s.born = g_time;
+            G.trSetPosition[Tr(o)](s.pos);
+            Buzz();
+        }
+    }
+    for (auto &s : g_shots) {
+        Il2CppObject *o = s.go.get();
+        if (!o) continue;
+        if (!Alive(o) || g_time - s.born > 6.0 || !f_propGun) { Kill(s.go); continue; }
+        Vector3 from = s.pos;
+        s.vel.y -= 9.8f * dt;
+        s.pos = s.pos + s.vel * dt;
+        Vector3 seg = s.pos - from;
+        float len = sqrtf(Dot(seg, seg));
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (len > 1e-4f && G.raycast.IsValid() && G.raycast(from, seg * (1.0f / len), &hit, len + 0.12f, -5)) {
+            float vn = Dot(s.vel, hit.normal);
+            s.vel = (s.vel - hit.normal * (2 * vn)) * 0.55f;       // bounce, losing energy
+            s.pos = hit.point + hit.normal * 0.14f;
+        }
+        G.trSetPosition[Tr(o)](s.pos);
+    }
+}
+
+// Grapple Hook: hold a trigger (either hand, or both) and a rope pulls you toward the spot that hand points at.
+struct Grapple { Ref go, line; bool on = false, prev = false; Vector3 point; };
+static Grapple g_grap[2];
+static void GrappleHand(Grapple &g, Il2CppObject *hand, bool trig, float dt, Vector3 &pull) {
+    bool held = f_grapple && trig && g_dance < 0 && !g_menuShown && hand && G.raycast.IsValid() && G.lrSetPosition.IsValid();
+    bool press = held && !g.prev;
+    g.prev = trig;
+    if (!held) {
+        if (g.on) { g.on = false; Show(g.go, false); }
+        return;
+    }
+    Vector3 start = G.trGetPosition[hand](), dir = G.trGetForward[hand]();
+    if (press) {
+        BNM::Structures::Unity::RaycastHit hit{};
+        if (!G.raycast(start + dir * 0.25f, dir, &hit, 80.0f, -5)) return;
+        g.point = hit.point;
+        g.on = true;
+        if (!g.line.get()) {                                       // each rope is made once
+            Il2CppObject *lineGo = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellGrapple"));
+            Il2CppObject *line = lineGo && G.tLine ? G.goAddComponent[lineGo](G.tLine) : nullptr;
+            if (!line) { g.on = false; return; }
+            if (Il2CppObject *m = G.rendererGetMaterial[line]()) {
+                if (G.shader.get()) G.matSetShader[m](G.shader.get());
+                G.matSetColor[m](Color(1.0f, 1.0f, 1.0f, 1));
+            }
+            G.lrSetStartWidth[line](0.02f);
+            G.lrSetEndWidth[line](0.02f);
+            G.lrSetPositionCount[line](2);
+            G.lrSetUseWorldSpace[line](true);
+            g.go.set(lineGo);
+            g.line.set(line);
+        }
+        Show(g.go, true);
+    }
+    Vector3 body;
+    if (!g.on || !BodyPos(body) || !Alive(g.line.get())) return;
+    Vector3 to = g.point - body;
+    float dist = sqrtf(Dot(to, to));
+    if (dist < 1.5f) { g.on = false; Show(g.go, false); return; }  // arrived
+    pull = pull + to * (45.0f * dt / dist);
+    G.lrSetPosition[g.line.get()](0, start);
+    G.lrSetPosition[g.line.get()](1, g.point);
+}
+static void GrappleTick(const Buttons &in, float dt) {
+    Vector3 v, pull(0, 0, 0);
+    GrappleHand(g_grap[0], g_leftHand.get(), in.ltrig, dt, pull);
+    GrappleHand(g_grap[1], g_rightHand.get(), in.rtrig, dt, pull);
+    if (!g_grap[0].on && !g_grap[1].on) return;
+    if (!GetVel(v)) return;
+    v = v + pull;                                                  // both ropes pull together
+    float speed = sqrtf(Dot(v, v));
+    if (speed > 28.0f) v = v * (28.0f / speed);
+    SetVel(v);
+}
+
+// Big Hands: both hands are scaled up and put back afterwards.
+static Method<Vector3> g_trGetScale;
+static bool g_bigApplied = false;
+static Vector3 g_handScaleL, g_handScaleR;
+static void ApplyBigHands() {
+    Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
+    if (!lh || !rh) return;
+    if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
+    if (!g_trGetScale.IsValid()) return;
+    if (f_bigHands && !g_bigApplied) {
+        g_handScaleL = g_trGetScale[lh]();
+        g_handScaleR = g_trGetScale[rh]();
+        G.trSetLocalScale[lh](g_handScaleL * 2.5f);
+        G.trSetLocalScale[rh](g_handScaleR * 2.5f);
+        g_bigApplied = true;
+    } else if (!f_bigHands && g_bigApplied) {
+        G.trSetLocalScale[lh](g_handScaleL);
+        G.trSetLocalScale[rh](g_handScaleR);
+        g_bigApplied = false;
+    }
+}
+
+static void OverpoweredOff() {
+    for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) { *it.flag = false; if (it.fn) it.fn(); }
+    Notify("Overpowered off");
+}
+static void OverpoweredTick(const Buttons &in, float dt) {
+    MegaJumpTick(in);
+    SuperFlyTick(in);
+    RocketTick(in, dt);
+    GrappleTick(in, dt);
+    GroundPoundTick(in);
+    FlingGunTick(in);
+    BounceTick();
+    ItemGunTick(in, dt);
+    if (f_bigHands != g_bigApplied) ApplyBigHands();           // also puts them back after Turn Everything Off
+    LongArmsTick();
+}
+static void OverpoweredReset() {                               // room change: the old objects are gone
+    g_laTrackersSet = false;
+    for (auto &g : g_grap) { Kill(g.go); g.line.clear(); g.on = g.prev = false; }
+    g_bigApplied = false;
+    g_laState = 0; g_laChecks = 0; g_laSpaceL = g_laSpaceR = -1; g_laOwns = false;
+    g_megaPrev = g_poundPrev = g_pounding = g_flingPrev = g_shotPrev = false;
+    for (auto &sh : g_shots) { Kill(sh.go); sh.born = -1; }
+    g_ringStart = -1;
+    for (auto &r : g_ring) Kill(r);
+}
+
+// ---- callbacks ---------------------------------------------------------------
+
+static void OnRoomChange() {
+    // The old room's objects are gone (or about to be): forget them, build again.
+    for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
+    for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
+    g_audioSrc.clear();
+    PauseTrackers(false);
+    g_dancing = false;
+    g_gunLine.clear();
+    WeatherReset();
+    OverpoweredReset();
+    if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
+        Buttons none;                             // trigger "released"
+        NoclipTick(none);
+    }
+    g_boosted = nullptr;
+    g_gravityOff = false;
+    for (Ref *r : {&g_player, &g_rigidbody, &g_leftHand, &g_rightHand, &g_head}) r->clear();
+    g_built = false; g_menuShown = false; g_touching = -2; g_haveSpot = false;
+}
+
+static void OnUpdate(float dt) {
+    g_time += dt;
+    g_frames++;
+    static double fpsStart = 0;
+    if (g_time - fpsStart >= 1.0) { g_fps = (float)(g_frames / (g_time - fpsStart)); g_frames = 0; fpsStart = g_time; }
+    if (!Lookups()) return;
+    auto *player = (Il2CppObject *)ym::api()->localPlayer();
+    if (!player) return;
+    if (player != g_player.get()) {                 // first frame in this room
+        OnRoomChange();
+        g_player.set(player);
+        g_leftHand.set(G.leftHand[player]());
+        g_rightHand.set(G.rightHand[player]());
+        g_head.set(G.headTransform[player]());
+        Il2CppObject *pgo = G.compGameObject[player]();
+        if (pgo) g_rigidbody.set(G.goGetComponent[pgo](G.tRigidbody));
+    }
+    if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
+    if (!g_built) BuildMenu();
+
+    Buttons in = ReadButtons();
+    ShowMenu(f_rightHand ? in.b : in.y);
+    if (g_menuShown) {
+        PlaceMenu();
+        CheckPress();
+        if (g_dirty) RenderPage();
+        UpdateTitle();
+        AnimateMenu();
+    }
+    if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
+    FlyTick(in, dt);
+    LowGravityTick(in, dt);
+    PlatformFor(in.lgrip, g_leftPlatform, g_leftHand);
+    PlatformFor(in.rgrip, g_rightPlatform, g_rightHand);
+    VelocityFlyTick(in);
+    CarTick(in);
+    IronManTick(in, dt);
+    ApplySpeedBoost();
+    ApplyGravity();
+    NoclipTick(in);
+    TeleportGunTick(in);
+    try { SpawnOnHandTick(in); ItemQueueTick(); }
+    catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
+    try { LoadTick(); }
+    catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
+    try { WeatherTick(dt); }
+    catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
+    try { OverpoweredTick(in, dt); }
+    catch (...) {
+        for (auto &it : g_items) if (it.cat == OVERPOWERED && it.kind == TOGGLE) *it.flag = false;
+        ym::log("clientdabell: overpowered error, turned off");
+    }
+    DanceTick(in, dt);              // last: it moves your hands after everything else
+}
+
+YM_EXPORT int YeepsMod_Init(const YeepsModApi *api) {
+    if (!ym::init(api)) return -1;
+    ym::onUpdate(OnUpdate);
+    ym::log("ClientDaBell %s loaded on %s (%s)", CDB_VERSION, api->gameVersion, api->buildId);
+    return 0;
+}
