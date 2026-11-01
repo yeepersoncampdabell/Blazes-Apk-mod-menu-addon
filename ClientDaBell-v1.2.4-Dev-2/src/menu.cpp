@@ -91,6 +91,7 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
     // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
     BNM::MonoType *tRecorder = nullptr;
@@ -167,6 +168,7 @@ static bool Lookups() {
             G.asSetLoop = asrc.GetMethod("set_loop", 1);
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
+            G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
@@ -442,7 +444,7 @@ static int g_dupeArmed = 0;
 
 static constexpr int kDances = 18;                 // 0-7 Rig Mods dances, 8-17 Emotes
 static bool g_danceSel[kDances];
-static bool g_wxSel[4];             // Effects: Snow, Rain, Thunderstorm, Disco (pick one, like the dances)
+static bool g_wxSel[3];             // Effects: Snow, Rain, Thunderstorm (pick one, like the dances)
 static int g_wx = -1;
 static bool g_todSel[4];            // Effects: Morning, Afternoon, Sunset, Night (pick one)
 static int g_tod = -1;
@@ -570,7 +572,6 @@ static Item g_items[] = {
     {EFFECTS, "Snow", TOGGLE, MAIN, &g_wxSel[0], WeatherPicked},
     {EFFECTS, "Rain", TOGGLE, MAIN, &g_wxSel[1], WeatherPicked},
     {EFFECTS, "Thunderstorm", TOGGLE, MAIN, &g_wxSel[2], WeatherPicked},
-    {EFFECTS, "Disco", TOGGLE, MAIN, &g_wxSel[3], WeatherPicked},
     {EFFECTS, "Effect Intensity", ACTION, MAIN, nullptr, NextWeatherIntensity},
     {EFFECTS, "Morning", TOGGLE, MAIN, &g_todSel[0], TodPicked},
     {EFFECTS, "Afternoon", TOGGLE, MAIN, &g_todSel[1], TodPicked},
@@ -657,12 +658,11 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Loop", "Repeats the song until you stop it."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
-    {"Effects", "Weather, disco and time of day. Only you see and hear them."},
+    {"Effects", "Weather and time of day. Only you see and hear them."},
     {"Morning", "Low sun, soft warm light and a little mist."},
     {"Afternoon", "High sun and a bright blue sky."},
     {"Sunset", "An orange sky with the sun on the horizon."},
     {"Night", "Dark sky, moon and stars."},
-    {"Disco", "A spinning disco ball with colored beams, lights and sparkles."},
     {"Snow", "Snow falls around you."},
     {"Rain", "Rain falls around you."},
     {"Thunderstorm", "Rain with lightning and thunder."},
@@ -2044,6 +2044,10 @@ static bool MicStart() {
             g_micPrevTransmit = G.recGetTransmit.IsValid() ? G.recGetTransmit[r]() : true;
             g_micPrevVad = G.recGetVad.IsValid() ? G.recGetVad[r]() : false;
         }
+        // Stop recording first so the Recorder starts clean on the song. Without this, a
+        // Recorder that went back to your mic (Others Hear It off, or Stop) could keep
+        // sending the mic and ignore the song the next time.
+        if (!g_micOn && G.recSetRecording.IsValid()) G.recSetRecording[r](false);
         g_micOn = true;
         MicApply(r, clip);
     } catch (...) {
@@ -2085,9 +2089,15 @@ static void SoundTick() {
     try { MicApply(r, clip); } catch (...) {}
     g_micCheckAt = g_time + 0.75;
 }
+static void PlayLoaded();
 static void SoundMicToggled() {
-    if (!f_soundMic) MicStop();
-    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+    if (!f_soundMic) { MicStop(); Notify("Soundboard: only you hear it"); return; }
+    // Switched back on while a song plays only for you: start it over through voice chat,
+    // so you and the room hear it from the same spot.
+    Il2CppObject *src = g_audioSrc.get();
+    bool playing = Alive(src) && G.asIsPlaying.IsValid() && G.asIsPlaying[src]();
+    if (playing && !g_micOn && !g_load.f && Alive(g_clip.get())) { PlayLoaded(); return; }
+    Notify("Soundboard: the room hears it");
 }
 
 static void PlayLoaded() {
@@ -2220,7 +2230,8 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
-    MicStop();
+    MicStop();                             // gives the mic back first, then
+    g_recorder.clear();                    // the voice object is looked up fresh on the next Play
 }
 static void ApplyLoop() {
     Il2CppObject *src = g_audioSrc.get();
@@ -2239,14 +2250,14 @@ static void NextSoundVolume() {
     Notify("Sound volume: %s", kSoundVolNames[g_soundVol]);
 }
 
-// ---- effects: snow, rain, thunderstorm, disco (only you see and hear them) -----------
+// ---- effects: snow, rain, thunderstorm (only you see and hear them) -----------------
 // Nothing here is sent to anyone. A fixed pool of small cubes (kMaxFx) falls around your
 // head and is reused: a piece that lands, or drifts too far away, restarts above you. The
 // pool is made a few pieces per frame, once, and is hidden (not destroyed) when you switch
 // the effect off. A thunderstorm adds a lightning bolt far away in the sky, a brief
 // dim flash of light, and a thunder rumble that is made from noise in code, once.
 static constexpr int kMaxFx = 100;
-static const int kFxCounts[4][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}, {30, 55, 80}};   // [effect][intensity]
+static const int kFxCounts[3][3] = {{40, 70, 100}, {50, 80, 100}, {50, 80, 100}};   // [effect][intensity]
 static const char *kFxIntensityNames[] = {"light", "medium", "heavy"};
 static int g_wxIntensity = 1;
 static Ref g_wxRoot, g_fx[kMaxFx], g_fxT[kMaxFx], g_bolt[7], g_wxLight, g_wxAudioGo, g_wxAudioSrc, g_wxClip;
@@ -2260,8 +2271,8 @@ static Method<void> g_lightType, g_lightIntensity, g_lightRange, g_lightColor;
 
 static void WeatherPicked() {
     int picked = -1;
-    for (int i = 0; i < 4; i++) if (g_wxSel[i] && i != g_wx) picked = i;
-    for (int i = 0; i < 4; i++) g_wxSel[i] = (i == picked);
+    for (int i = 0; i < 3; i++) if (g_wxSel[i] && i != g_wx) picked = i;
+    for (int i = 0; i < 3; i++) g_wxSel[i] = (i == picked);
     g_wx = picked;
 }
 static void NextWeatherIntensity() { g_wxIntensity = (g_wxIntensity + 1) % 3; Notify("Effect intensity: %s", kFxIntensityNames[g_wxIntensity]); }
@@ -2284,7 +2295,6 @@ static void StyleFx(int i, int mode) {
     Il2CppObject *o = g_fx[i].get(), *t = g_fxT[i].get();
     if (!Alive(o) || !t) return;
     if (mode == 0) { SetColor(o, Color(0.95f, 0.97f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.02f, 0.02f, 0.02f)); }
-    else if (mode == 3) { SetColor(o, Rainbow(i / 17.0f)); G.trSetLocalScale[t](Vector3(0.025f, 0.025f, 0.025f)); }
     else           { SetColor(o, Color(0.65f, 0.78f, 1.0f, 1)); G.trSetLocalScale[t](Vector3(0.004f, 0.07f, 0.004f)); }
 }
 
@@ -2408,122 +2418,12 @@ static void StormTick(Vector3 hp) {
     if (g_thunderAt > 0 && g_time >= g_thunderAt) { PlayThunder(); g_thunderAt = 0; }
 }
 
-// ---- disco ------------------------------------------------------------------------
-// A silver ball above your head with colored mirror tiles, spinning; six colored beams
-// sweeping down from it; three colored lights circling you, pulsing to a 120 BPM beat;
-// and the effect pool used as floating rainbow sparkles. Everything is made once, parented
-// to the weather root (so it hides and is destroyed with the other effects), and only
-// moved and recolored after that.
-static constexpr int kDiscoFacets = 14, kDiscoBeams = 6, kDiscoLights = 3;
-static Ref g_discoBall, g_discoFacet[kDiscoFacets], g_discoBeam[kDiscoBeams], g_discoLight[kDiscoLights];
-static bool g_discoShown = false;
-
-static void HideDisco() {
-    if (!g_discoShown) return;
-    g_discoShown = false;
-    Show(g_discoBall, false);
-    for (auto &b : g_discoBeam) Show(b, false);
-    for (auto &l : g_discoLight) if (Alive(l.get())) G.behaviourSetEnabled[l.get()](false);
-}
-static void DiscoClear() {                                     // the objects died with the weather root
-    g_discoBall.clear();
-    for (auto &f : g_discoFacet) f.clear();
-    for (auto &b : g_discoBeam) b.clear();
-    for (auto &l : g_discoLight) l.clear();
-    g_discoShown = false;
-}
+// Light setters, looked up once (used by the thunderstorm flash and the time of day).
 static void LightMethods(Class &light) {
     if (!g_lightType.IsValid()) g_lightType = light.GetMethod("set_type", 1);
     if (!g_lightIntensity.IsValid()) g_lightIntensity = light.GetMethod("set_intensity", 1);
     if (!g_lightRange.IsValid()) g_lightRange = light.GetMethod("set_range", 1);
     if (!g_lightColor.IsValid()) g_lightColor = light.GetMethod("set_color", 1);
-}
-static void EnsureDisco() {
-    if (!EnsureWxRoot()) return;
-    Il2CppObject *root = Tr(g_wxRoot.get());
-    if (!Alive(g_discoBall.get())) {
-        Il2CppObject *ball = Prim(0, Color(0.78f, 0.80f, 0.86f, 1), false);
-        if (!ball) return;
-        Il2CppObject *bt = Tr(ball);
-        G.trSetParent[bt](root, false);
-        G.trSetLocalScale[bt](Vector3(0.5f, 0.5f, 0.5f));
-        g_discoBall.set(ball);
-        for (int i = 0; i < kDiscoFacets; i++) {               // tiles spread over the ball (a golden-angle spiral)
-            float y = 1 - 2 * (i + 0.5f) / kDiscoFacets, r = sqrtf(1 - y * y), a = i * 2.39996f;
-            Vector3 d(cosf(a) * r, y, sinf(a) * r);
-            Il2CppObject *f = Cube(Rainbow(i / (float)kDiscoFacets), false);
-            if (!f) continue;
-            Il2CppObject *ft = Tr(f);
-            G.trSetParent[ft](bt, false);
-            G.trSetLocalPosition[ft](d * 0.5f);
-            G.trSetLocalRotation[ft](Quaternion::LookRotation(d));
-            G.trSetLocalScale[ft](Vector3(0.2f, 0.2f, 0.04f));
-            g_discoFacet[i].set(f);
-        }
-    }
-    for (int i = 0; i < kDiscoBeams; i++) {
-        if (Alive(g_discoBeam[i].get())) continue;
-        Il2CppObject *b = Cube(Rainbow(i / (float)kDiscoBeams), false);
-        if (!b) continue;
-        G.trSetParent[Tr(b)](root, false);
-        g_discoBeam[i].set(b);
-    }
-    Class light("UnityEngine", "Light");
-    if (!light.IsValid()) return;
-    LightMethods(light);
-    for (int i = 0; i < kDiscoLights; i++) {
-        if (Alive(g_discoLight[i].get())) continue;
-        Il2CppObject *go = Class("UnityEngine", "GameObject").CreateNewObjectParameters(CreateMonoString("ClientDaBellDiscoLight"));
-        Il2CppObject *l = go ? G.goAddComponent[go](light.GetMonoType()) : nullptr;
-        if (!l) continue;
-        G.trSetParent[Tr(go)](root, false);
-        if (g_lightType.IsValid()) g_lightType[l](2);              // point light
-        if (g_lightRange.IsValid()) g_lightRange[l](9.0f);
-        g_discoLight[i].set(l);
-    }
-}
-static void DiscoTick(Vector3 hp, int intensity) {
-    EnsureDisco();
-    float t = (float)g_time;
-    float beat = 1.0f - (t * 2.0f - floorf(t * 2.0f));             // 120 BPM: jumps to 1 on each beat, then fades
-    beat = 0.55f + 0.45f * beat * beat;
-    if (!g_discoShown) {
-        g_discoShown = true;
-        Show(g_discoBall, true);
-        for (auto &b : g_discoBeam) Show(b, true);
-    }
-    Vector3 ball = hp + Vector3(0, 2.2f, 0);
-    Il2CppObject *bo = g_discoBall.get();
-    if (Alive(bo)) {
-        Il2CppObject *bt = Tr(bo);
-        float spin = t * 1.2f;
-        G.trSetPosition[bt](ball);
-        G.trSetRotation[bt](Quaternion(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f)));
-    }
-    if (g_frames % 3 == 0)                                          // tiles twinkle through the colors
-        for (int i = 0; i < kDiscoFacets; i++) SetColor(g_discoFacet[i].get(), Rainbow(t * 0.5f + i * 0.37f));
-    const float len = 6.0f, tilt = 0.9f;                            // beams: about 50 degrees down from straight up
-    for (int i = 0; i < kDiscoBeams; i++) {
-        Il2CppObject *b = g_discoBeam[i].get();
-        if (!Alive(b)) continue;
-        float a = t * 0.8f + i * 6.2831853f / kDiscoBeams, wob = tilt + 0.25f * sinf(t * 1.3f + i);
-        Vector3 d(cosf(a) * sinf(wob), -cosf(wob), sinf(a) * sinf(wob));
-        Il2CppObject *bt = Tr(b);
-        G.trSetPosition[bt](ball + d * (len * 0.5f + 0.25f));
-        G.trSetRotation[bt](Quaternion::LookRotation(d));
-        G.trSetLocalScale[bt](Vector3(0.03f, 0.03f, len));
-        if (g_frames % 3 == 1) SetColor(b, Rainbow(t * 0.3f + i / (float)kDiscoBeams));
-    }
-    const float strength[] = {1.5f, 2.5f, 3.5f};
-    for (int i = 0; i < kDiscoLights; i++) {
-        Il2CppObject *l = g_discoLight[i].get();
-        if (!Alive(l)) continue;
-        G.behaviourSetEnabled[l](true);
-        float a = t * 1.1f + i * 6.2831853f / kDiscoLights;
-        G.trSetPosition[Tr(G.compGameObject[l]())](hp + Vector3(cosf(a) * 2.0f, 1.0f, sinf(a) * 2.0f));
-        if (g_lightColor.IsValid()) g_lightColor[l](Rainbow(t * 0.25f + i / (float)kDiscoLights));
-        if (g_lightIntensity.IsValid()) g_lightIntensity[l](strength[intensity] * beat);
-    }
 }
 
 static void WeatherOff() {
@@ -2537,7 +2437,6 @@ static void WeatherOff() {
     if (Alive(g_wxLight.get())) G.behaviourSetEnabled[g_wxLight.get()](false);
     if (Alive(g_wxAudioSrc.get()) && G.asStop.IsValid()) G.asStop[g_wxAudioSrc.get()]();
     HideBolt();
-    HideDisco();
 }
 static void WeatherReset() {                                   // room change: the old objects are gone
     Kill(g_wxRoot);
@@ -2545,7 +2444,6 @@ static void WeatherReset() {                                   // room change: t
     Kill(g_wxClip);
     for (int i = 0; i < kMaxFx; i++) { g_fx[i].clear(); g_fxT[i].clear(); }
     for (int i = 0; i < 7; i++) g_bolt[i].clear();
-    DiscoClear();
     g_wxLight.clear();
     g_wxAudioSrc.clear();
     g_fxMade = 0; g_fxMode = -1; g_fxShown = -1;
@@ -2599,24 +2497,16 @@ static void WeatherTick(float dt) {
             p.y -= 1.1f * dt;
             p.x += sinf(t * 1.1f + g_fxPhase[i]) * 0.35f * dt;
             p.z += cosf(t * 0.9f + g_fxPhase[i]) * 0.35f * dt;
-        } else if (mode == 3) {                                // disco: sparkles float and circle around you
-            float dx = p.x - hp.x, dz = p.z - hp.z;
-            p.x += -dz * 0.25f * dt;
-            p.z += dx * 0.25f * dt;
-            p.y += sinf(t * 2.0f + g_fxPhase[i]) * 0.25f * dt;
-            if ((g_frames + i) % 4 == 0) SetColor(g_fx[i].get(), Rainbow(t * 0.4f + g_fxPhase[i]));
         } else {                                               // rain: fast, a little wind
             p.y -= 9.0f * dt;
             p.x += 0.6f * dt;
         }
         float dx = p.x - hp.x, dz = p.z - hp.z;
-        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, mode == 3);
+        if (p.y < g_groundY || dx * dx + dz * dz > 25.0f) RespawnFx(i, hp, false);
         if (Il2CppObject *tr = g_fxT[i].get()) G.trSetPosition[tr](p);
     }
     if (mode == 2) StormTick(hp);
     else { HideBolt(); g_nextBolt = 0; }
-    if (mode == 3) DiscoTick(hp, intensity);
-    else HideDisco();
 }
 
 // ---- time of day: morning, afternoon, sunset, night ------------------------------------
