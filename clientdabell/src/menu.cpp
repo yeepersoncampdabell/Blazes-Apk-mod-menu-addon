@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.4"
+#define CDB_VERSION "v1.2.4 Dev"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -97,7 +97,7 @@ static struct {
     Method<void> recSetSource, recSetClip, recSetLoop, recSetTransmit, recSetVad, recRestart0, recRestart1,
                  recSetRecording, recSetOnlyWhenEnabled, recStart;
     Method<int> recGetSource;
-    Method<bool> recGetTransmit, recGetVad;
+    Method<bool> recGetTransmit, recGetVad, recGetRecording;
     Field<int> recFieldSource;                         // the backing fields, set too (some versions read these)
     Field<Il2CppObject *> recFieldClip;
     Field<bool> recFieldLoop;
@@ -179,6 +179,7 @@ static bool Lookups() {
             G.recSetVad = rec.GetMethod("set_VoiceDetection", 1);       // off while a song plays, or quiet parts get cut
             G.recGetVad = rec.GetMethod("get_VoiceDetection", 0);
             G.recSetRecording = rec.GetMethod("set_IsRecording", 1);
+            G.recGetRecording = rec.GetMethod("get_IsRecording", 0);
             G.recSetOnlyWhenEnabled = rec.GetMethod("set_RecordOnlyWhenEnabled", 1);
             G.recStart = rec.GetMethod("StartRecording", 0);
             G.recFieldSource = rec.GetField("sourceType");
@@ -464,8 +465,8 @@ static void NextJumpPower();
 static void OverpoweredOff();
 static void NextWeatherIntensity();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -486,6 +487,7 @@ static Item g_items[] = {
     {MAIN, "Overpowered", OPEN, OVERPOWERED},
     {MAIN, "Enabled Mods", OPEN, ENABLED},
     {MAIN, "Emotes", OPEN, EMOTES},
+    {MAIN, "Credits", OPEN, CREDITS},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -573,6 +575,9 @@ static Item g_items[] = {
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
     {SETTINGS, "Turn Everything Off", ACTION, MAIN, nullptr, AllOff},
+
+    {CREDITS, "Exit Credits", OPEN, MAIN},
+    {CREDITS, "@CampDaBell", ACTION, MAIN, nullptr, nullptr},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
@@ -582,6 +587,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Settings", "Opens the settings."},
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
+    {"Credits", "Who made this menu."},
+    {"@CampDaBell", "The menu is made by @CampDaBell."},
     {"Platforms", "Hold a grip to stand on a platform."},
     {"Fly", "Hold A to fly where you look."},
     {"Fast Fly", "Makes Fly a lot faster."},
@@ -1733,10 +1740,13 @@ static void SpawnOnHandTick(const Buttons &in) {
 // also sent through Photon Voice: the Recorder (your mic) is switched to the song, and put
 // back to your mic when the song ends, you press Stop, or you leave the room.
 // WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
-// the game never stalls, and mixed down to mono to save memory.
+// the game never stalls, and mixed down to mono to save memory. Every song is converted to
+// 48 kHz while it loads: Photon Voice only sends 8/12/16/24/48 kHz, so a 44.1 kHz song
+// (most of them) would sometimes not be heard by the room at all.
 static constexpr int kMaxSongs = 64;
-static constexpr uint64_t kMaxFrames = 12000000;       // about 4.5 minutes at 44.1 kHz
-static constexpr uint32_t kChunkFrames = 32768;        // frames read per game frame
+static constexpr double kMaxSeconds = 272;             // about 4.5 minutes
+static constexpr uint32_t kChunkFrames = 32768;        // 48 kHz frames made per game frame
+static constexpr uint32_t kVoiceRate = 48000;
 static std::vector<std::string> g_songs;
 static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
 static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
@@ -1747,10 +1757,14 @@ struct Loader {
     FILE *f = nullptr;
     int channels = 0, bits = 0, fmt = 0;               // fmt 1 = whole numbers, 3 = floating point
     uint32_t rate = 0, block = 0;
-    uint64_t frames = 0, done = 0;
+    uint64_t frames = 0, done = 0;                     // frames in the file, frames read so far
+    uint64_t outFrames = 0, outDone = 0;               // 48 kHz frames in the clip, written so far
+    double step = 1;                                   // file frames per 48 kHz frame
+    float prevA = 0, prevB = 0;                        // the last two file samples of the previous slice
     int song = -1, lastTen = -1;
     bool playWhenDone = false;
     std::vector<uint8_t> buf;
+    std::vector<float> mono;
 } g_load;
 
 static uint32_t U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -1870,6 +1884,8 @@ static bool EnsureAudioSource() {
 static Ref g_recorder;
 static bool g_micOn = false, g_micPrevTransmit = true, g_micPrevVad = false;
 static double g_micUntil = 0, g_clipLen = 0;      // when the song ends; the song's length in seconds
+static double g_micCheckAt = 0;                  // when to check the room is getting it
+static int g_micTries = 0;
 
 static Il2CppObject *FindRecorder() {
     Il2CppObject *r = g_recorder.get();
@@ -1921,6 +1937,7 @@ static void MicStop() {
     if (!g_micOn) return;
     g_micOn = false;
     g_micUntil = 0;
+    g_micCheckAt = 0;
     Il2CppObject *r = g_recorder.get();
     if (!Alive(r)) { g_recorder.clear(); return; }
     try {
@@ -1932,9 +1949,30 @@ static void MicStop() {
     } catch (...) { ym::log("clientdabell: couldn't put the mic back"); }
 }
 
+
+// Switches the recorder to the song. Used on Play, and again if a check finds it didn't take.
+static void MicApply(Il2CppObject *r, Il2CppObject *clip) {
+    RecSetInput(r, 1, clip, f_soundLoop);
+    if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](true);     // sends even with push to talk
+    if (G.recSetVad.IsValid()) G.recSetVad[r](false);              // quiet parts aren't cut off
+    if (G.recSetOnlyWhenEnabled.IsValid()) G.recSetOnlyWhenEnabled[r](false);
+    if (G.recSetRecording.IsValid()) G.recSetRecording[r](true);
+    RecRestart(r);
+}
+static bool MicTookHold(Il2CppObject *r) {
+    if (!Alive(r)) return false;
+    bool src = !G.recGetSource.IsValid() || G.recGetSource[r]() == 1;
+    bool rec = !G.recGetRecording.IsValid() || G.recGetRecording[r]();
+    bool tx = !G.recGetTransmit.IsValid() || G.recGetTransmit[r]();
+    return src && rec && tx;
+}
+
 // Sends the loaded song to the room. Returns false if it only plays for you.
 static bool MicStart() {
     if (!f_soundMic) return false;
+    // Look the recorder up again on every Play (unless a song is already going through one):
+    // the game can swap its voice object, and an old one would send nothing.
+    if (!g_micOn) g_recorder.clear();
     Il2CppObject *r = FindRecorder(), *clip = g_clip.get();
     if (!r || !Alive(clip) || !(G.recSetSource.IsValid() || G.recFieldSource.IsValid())) {
         ym::log("clientdabell: no voice recorder (type=%d), song plays only for you", G.tRecorder != nullptr);
@@ -1945,13 +1983,8 @@ static bool MicStart() {
             g_micPrevTransmit = G.recGetTransmit.IsValid() ? G.recGetTransmit[r]() : true;
             g_micPrevVad = G.recGetVad.IsValid() ? G.recGetVad[r]() : false;
         }
-        RecSetInput(r, 1, clip, f_soundLoop);
-        if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](true);     // sends even with push to talk
-        if (G.recSetVad.IsValid()) G.recSetVad[r](false);              // quiet parts aren't cut off
-        if (G.recSetOnlyWhenEnabled.IsValid()) G.recSetOnlyWhenEnabled[r](false);
-        if (G.recSetRecording.IsValid()) G.recSetRecording[r](true);
         g_micOn = true;
-        RecRestart(r);
+        MicApply(r, clip);
     } catch (...) {
         ym::log("clientdabell: voice chat error, putting the mic back");
         g_micOn = true;
@@ -1959,12 +1992,37 @@ static bool MicStart() {
         return false;
     }
     g_micUntil = g_time + g_clipLen + 0.5;
+    g_micCheckAt = g_time + 0.4;                       // make sure it took (Photon can ignore it right after joining)
+    g_micTries = 0;
     return true;
 }
 
-// Every frame: give the mic back once a song (not looping) has finished.
+// Every frame: re-check a song that was just sent, and give the mic back when it's over.
 static void SoundTick() {
-    if (g_micOn && !f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) MicStop();
+    if (!g_micOn) return;
+    if (!f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) { MicStop(); return; }
+    if (g_micCheckAt <= 0 || g_time < g_micCheckAt) return;
+    Il2CppObject *r = g_recorder.get();
+    if (MicTookHold(r)) {
+        if (g_micTries > 0) Notify("The room hears it now");
+        ym::log("clientdabell: voice check ok (after %d retries)", g_micTries);
+        g_micCheckAt = 0;
+        return;
+    }
+    if (g_micTries >= 4) {
+        ym::log("clientdabell: voice chat wouldn't take the song, giving the mic back");
+        Notify("Voice chat didn't take it, only you hear it");
+        MicStop();
+        return;
+    }
+    g_micTries++;
+    if (!Alive(r)) { g_recorder.clear(); r = FindRecorder(); }
+    Il2CppObject *clip = g_clip.get();
+    if (!r || !Alive(clip)) { g_micCheckAt = g_time + 0.75; return; }
+    ym::log("clientdabell: voice didn't take (source=%d recording=%d), retry %d", G.recGetSource.IsValid() ? G.recGetSource[r]() : -1,
+            G.recGetRecording.IsValid() ? (int)G.recGetRecording[r]() : -1, g_micTries);
+    try { MicApply(r, clip); } catch (...) {}
+    g_micCheckAt = g_time + 0.75;
 }
 static void SoundMicToggled() {
     if (!f_soundMic) MicStop();
@@ -1994,16 +2052,21 @@ static void StartLoad(int song, bool playAfter) {
     const char *err = "";
     if (!OpenWav(SongsDir() + "/" + g_songs[song], L, &err)) { Notify("%s", err); return; }
     if (L.frames == 0) { fclose(L.f); Notify("That song is empty"); return; }
-    if (L.frames > kMaxFrames) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    if ((double)L.frames / L.rate > kMaxSeconds) { fclose(L.f); Notify("Song too long (max about 4 minutes)"); return; }
+    L.step = (double)L.rate / kVoiceRate;
+    L.outFrames = (uint64_t)((double)L.frames / L.step);
+    if (L.outFrames == 0) L.outFrames = 1;
     if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
     g_clip.clear();
     g_clipSong = -1;
-    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.frames, 1, (int)L.rate, false);
+    Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.outFrames, 1, (int)kVoiceRate, false);
     Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
     if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
     g_clip.set(clip);
     g_chunk.set(chunk);
-    L.buf.resize((size_t)kChunkFrames * L.block);
+    size_t srcMax = (size_t)(kChunkFrames * L.step) + 4;          // file frames one slice can need
+    L.buf.resize(srcMax * L.block);
+    L.mono.resize(srcMax);
     L.song = song;
     L.playWhenDone = playAfter;
     g_load = std::move(L);
@@ -2012,45 +2075,71 @@ static void StartLoad(int song, bool playAfter) {
     Notify("Loading %.30s", SongTitle(song).c_str());
 }
 
-// Called every frame: reads the next slice of the song into the clip (about 32k frames).
+// Called every frame: reads the next slice of the song, mixes it to mono, converts it to
+// 48 kHz (straight-line between samples) and writes 32k frames into the clip.
 static void LoadTick() {
     Loader &L = g_load;
     if (!L.f) return;
     Il2CppObject *clip = g_clip.get();
     if (!Alive(clip)) { AbortLoad(); return; }
-    uint64_t want = L.frames - L.done < kChunkFrames ? L.frames - L.done : kChunkFrames;
-    size_t got = fread(L.buf.data(), 1, (size_t)(want * L.block), L.f);
-    uint64_t n = got / L.block;
-    if (n > 0) {
-        Il2CppObject *arr = n == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+    uint64_t wantOut = L.outFrames - L.outDone < kChunkFrames ? L.outFrames - L.outDone : kChunkFrames;
+    // the file frames this slice needs: up to the one after the last output's position
+    uint64_t needEnd = (uint64_t)((double)(L.outDone + wantOut - 1) * L.step) + 2;
+    if (needEnd > L.frames) needEnd = L.frames;
+    uint64_t readN = needEnd > L.done ? needEnd - L.done : 0;
+    if (readN > L.mono.size()) readN = L.mono.size();
+    uint64_t n = readN ? fread(L.buf.data(), 1, (size_t)(readN * L.block), L.f) / L.block : 0;
+    const int bytes = L.bits / 8;
+    const float inv = 1.0f / (float)L.channels;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t *p = L.buf.data() + i * L.block;
+        float sum = 0;
+        for (int c = 0; c < L.channels; c++) {
+            const uint8_t *q = p + c * bytes;
+            float v;
+            if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
+            else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
+            else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
+            else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
+            else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
+            sum += v;
+        }
+        float m = sum * inv;
+        L.mono[i] = m > 1 ? 1.f : m < -1 ? -1.f : m;
+    }
+    const uint64_t base = L.done;
+    L.done += n;
+    bool fileEnded = n < readN;
+    if (fileEnded && n == 0) wantOut = 0;            // nothing left to read: stop here
+    if (wantOut > 0) {
+        Il2CppObject *arr = wantOut == kChunkFrames ? g_chunk.get() : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)wantOut);
         if (!arr) { AbortLoad(); Notify("Not enough memory for that song"); return; }
         float *dst = (float *)((uint8_t *)arr + 0x20);
-        const int bytes = L.bits / 8;
-        const float inv = 1.0f / (float)L.channels;
-        for (uint64_t i = 0; i < n; i++) {
-            const uint8_t *p = L.buf.data() + i * L.block;
-            float sum = 0;
-            for (int c = 0; c < L.channels; c++) {
-                const uint8_t *q = p + c * bytes;
-                float v;
-                if (L.fmt == 3) { uint32_t u = U32(q); memcpy(&v, &u, 4); }
-                else if (L.bits == 16) v = (float)(int16_t)U16(q) * (1.0f / 32768.0f);
-                else if (L.bits == 24) v = (float)(int32_t)(((uint32_t)q[0] << 8) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 24)) * (1.0f / 2147483648.0f);
-                else if (L.bits == 32) v = (float)(int32_t)U32(q) * (1.0f / 2147483648.0f);
-                else v = ((float)q[0] - 128.0f) * (1.0f / 128.0f);
-                sum += v;
-            }
-            dst[i] = sum * inv;
+        auto S = [&](uint64_t k) -> float {                           // file sample k, from this slice or the last
+            if (k + 2 == base) return L.prevA;
+            if (k + 1 == base) return L.prevB;
+            if (k < base) return L.prevA;
+            uint64_t j = k - base;
+            return j < n ? L.mono[j] : (n ? L.mono[n - 1] : L.prevB);
+        };
+        for (uint64_t i = 0; i < wantOut; i++) {
+            double pos = (double)(L.outDone + i) * L.step;
+            uint64_t k = (uint64_t)pos;
+            float f = (float)(pos - (double)k), s0 = S(k), s1 = S(k + 1);
+            dst[i] = s0 + (s1 - s0) * f;
         }
-        G.audioClipSetData[clip](arr, (int)L.done);
-        L.done += n;
-        int ten = (int)(L.done * 10 / L.frames);
-        if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+        G.audioClipSetData[clip](arr, (int)L.outDone);
+        L.outDone += wantOut;
     }
-    if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
+    if (n >= 2) { L.prevA = L.mono[n - 2]; L.prevB = L.mono[n - 1]; }
+    else if (n == 1) { L.prevA = L.prevB; L.prevB = L.mono[0]; }
+    int ten = (int)(L.outDone * 10 / L.outFrames);
+    if (ten != L.lastTen && ten < 10) { L.lastTen = ten; Notify("Loading %d%%", ten * 10); }
+    if (L.outDone >= L.outFrames || wantOut == 0) {                   // finished (or the file ended early)
         bool play = L.playWhenDone;
         int song = L.song;
-        g_clipLen = L.rate ? (double)L.done / (double)L.rate : 0;
+        g_clipLen = (double)L.outDone / kVoiceRate;
+        ym::log("clientdabell: loaded %s, %u Hz -> 48000 Hz, %.1f s", g_songs[song].c_str(), L.rate, g_clipLen);
         AbortLoad();
         g_clipSong = song;
         if (play) PlayLoaded();
