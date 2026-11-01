@@ -92,6 +92,16 @@ static struct {
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     BNM::MonoType *tAudioSource = nullptr;
+    // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
+    BNM::MonoType *tRecorder = nullptr;
+    Method<void> recSetSource, recSetClip, recSetLoop, recSetTransmit, recSetVad, recRestart0, recRestart1,
+                 recSetRecording, recSetOnlyWhenEnabled, recStart;
+    Method<int> recGetSource;
+    Method<bool> recGetTransmit, recGetVad;
+    Field<int> recFieldSource;                         // the backing fields, set too (some versions read these)
+    Field<Il2CppObject *> recFieldClip;
+    Field<bool> recFieldLoop;
+    Method<Il2CppObject *> goFind;
     BNM::IL2CPP::Il2CppClass *floatClass = nullptr;
     BNM::IL2CPP::MethodInfo *rpcCreateItem = nullptr;     // only read for its parameter types
     BNM::IL2CPP::Il2CppClass *objectClass = nullptr, *stringClass = nullptr;
@@ -157,7 +167,34 @@ static bool Lookups() {
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
         }
+        Class rec("Photon.Voice.Unity", "Recorder");
+        if (rec.IsValid()) {
+            G.tRecorder = rec.GetMonoType();
+            G.recSetSource = rec.GetMethod("set_SourceType", 1);       // 0 = Microphone, 1 = AudioClip
+            G.recGetSource = rec.GetMethod("get_SourceType", 0);
+            G.recSetClip = rec.GetMethod("set_AudioClip", 1);
+            G.recSetLoop = rec.GetMethod("set_LoopAudioClip", 1);
+            G.recSetTransmit = rec.GetMethod("set_TransmitEnabled", 1);
+            G.recGetTransmit = rec.GetMethod("get_TransmitEnabled", 0);
+            G.recSetVad = rec.GetMethod("set_VoiceDetection", 1);       // off while a song plays, or quiet parts get cut
+            G.recGetVad = rec.GetMethod("get_VoiceDetection", 0);
+            G.recSetRecording = rec.GetMethod("set_IsRecording", 1);
+            G.recSetOnlyWhenEnabled = rec.GetMethod("set_RecordOnlyWhenEnabled", 1);
+            G.recStart = rec.GetMethod("StartRecording", 0);
+            G.recFieldSource = rec.GetField("sourceType");
+            G.recFieldClip = rec.GetField("audioClip");
+            G.recFieldLoop = rec.GetField("loopAudioClip");
+            for (auto &m : rec.GetMethods(false)) {                     // RestartRecording() or RestartRecording(bool)
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "RestartRecording") != 0) continue;
+                if (mi->parameters_count == 0) G.recRestart0 = m;
+                else if (mi->parameters_count == 1) G.recRestart1 = m;
+            }
+        }
+        ym::log("clientdabell: voice recorder=%d source=%d clip=%d restart=%d/%d", G.tRecorder != nullptr, G.recSetSource.IsValid(),
+                G.recSetClip.IsValid(), G.recRestart0.IsValid(), G.recRestart1.IsValid());
     }
+    G.goFind = go.GetMethod("Find", 1);
     G.trSetParent = Overload(tr, "SetParent", {"UnityEngine.Transform", "System.Boolean"});
     G.trSetPosition = tr.GetMethod("set_position", 1);
     G.trSetRotation = tr.GetMethod("set_rotation", 1);
@@ -294,15 +331,10 @@ static bool Lookups() {
                 Il2CppObject *fo = fc.IsValid() ? fc.CreateNewObjectParameters(CreateMonoString(fpath.c_str())) : nullptr;
                 bool good = fo && G.alive((Il2CppObject *)fo);
                 ym::log("clientdabell: font ctor(path): object=%d alive=%d", fo ? 1 : 0, good ? 1 : 0);
-                if (!good && fc.IsValid()) {                       // second route: empty Font, then load the file into it
-                    Il2CppObject *f2 = fc.CreateNewObjectParameters();
-                    Method<void> load = fc.GetMethod("Internal_CreateFontFromPath", 2);
-                    if (f2 && load.IsValid()) {
-                        load(f2, (BNM::Structures::Mono::String *)CreateMonoString(fpath.c_str()));
-                        fo = f2;
-                        good = G.alive((Il2CppObject *)fo);
-                    }
-                    ym::log("clientdabell: font second route: object=%d loader=%d alive=%d", f2 ? 1 : 0, load.IsValid() ? 1 : 0, good ? 1 : 0);
+                if (!good && fc.IsValid()) {                       // second route: pick the constructor that takes one string
+                    Il2CppObject *f2 = fc.CreateNewObjectTypes({"System.String"}, CreateMonoString(fpath.c_str()));
+                    if (f2 && G.alive((Il2CppObject *)f2)) { fo = f2; good = true; }
+                    ym::log("clientdabell: font second route (string ctor): object=%d alive=%d", f2 ? 1 : 0, good ? 1 : 0);
                 }
                 MethodBase hasChar = fc.IsValid() ? Overload(fc, "HasCharacter", {"System.Char"}) : MethodBase();
                 if (good && hasChar.IsValid()) {
@@ -381,6 +413,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop;
+static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -423,6 +456,7 @@ static void PrevSong();
 static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
+static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
 static void NextArmLength();
@@ -503,6 +537,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Next Song", ACTION, MAIN, nullptr, NextSong},
     {SOUNDBOARD, "Previous Song", ACTION, MAIN, nullptr, PrevSong},
     {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
+    {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
@@ -580,12 +615,13 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Jumping Jacks", "Arms go up and down at your sides. Hold left trigger."},
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
-    {"Soundboard", "Plays .wav songs from the sounds folder. Only you hear them."},
+    {"Soundboard", "Plays .wav songs from the sounds folder, through your voice chat."},
+    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it."},
     {"Next Song", "Picks the next song in the list."},
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
-    {"Sound Volume", "Quiet, medium or loud."},
+    {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
     {"Effects", "Snow, rain and thunderstorms. Only you see and hear them."},
     {"Snow", "Snow falls around you."},
@@ -665,7 +701,7 @@ static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify) g_view.push_back(&it);
+        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -1109,7 +1145,7 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
     g_wx = -1;
@@ -1693,7 +1729,9 @@ static void SpawnOnHandTick(const Buttons &in) {
 // ---- soundboard: songs you copy onto the headset ----------------------------------------
 // Put .wav files in a folder named "sounds" next to the .so files in the mods folder
 // (Android/data/com.TrassGames.Yeeps/files/mods/sounds/). Open Soundboard, pick a song, press
-// Play. Only you hear it: it plays on an audio source on your head, nothing is sent.
+// Play. You hear it on an audio source on your head. With "Others Hear It" on, the song is
+// also sent through Photon Voice: the Recorder (your mic) is switched to the song, and put
+// back to your mic when the song ends, you press Stop, or you leave the room.
 // WAV only (PCM 8/16/24/32-bit or 32-bit float). The song is read a little each frame, so
 // the game never stalls, and mixed down to mono to save memory.
 static constexpr int kMaxSongs = 64;
@@ -1825,6 +1863,114 @@ static bool EnsureAudioSource() {
     return true;
 }
 
+// ---- soundboard through voice chat (Photon Voice Recorder) ----------------------------
+// The Recorder is what sends your mic to the room. While a song plays it is switched to
+// "AudioClip" input with our song, so everyone near you hears it like your voice. Your
+// own settings (push to talk, voice detection) are saved first and put back after.
+static Ref g_recorder;
+static bool g_micOn = false, g_micPrevTransmit = true, g_micPrevVad = false;
+static double g_micUntil = 0, g_clipLen = 0;      // when the song ends; the song's length in seconds
+
+static Il2CppObject *FindRecorder() {
+    Il2CppObject *r = g_recorder.get();
+    if (Alive(r)) return r;
+    g_recorder.clear();
+    r = nullptr;
+    if (!G.tRecorder) return nullptr;
+    if (G.goFind.IsValid()) {                       // the voice object most Photon VR games use
+        Il2CppObject *go = G.goFind(CreateMonoString("PhotonVRVoice"));
+        if (Alive(go)) r = G.goGetComponent[go]((Il2CppObject *)G.tRecorder);
+    }
+    if (!Alive(r) && (G.findScene.IsValid() || G.findSceneByType.IsValid())) {   // else any Recorder, an enabled one first
+        auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tRecorder)
+                                                      : G.findSceneByType((Il2CppObject *)G.tRecorder, 0));
+        uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+        auto **el = arr ? (Il2CppObject **)(arr + 0x20) : nullptr;
+        for (uintptr_t i = 0; i < n && !Alive(r); i++)
+            if (Alive(el[i]) && (!G.behaviourGetEnabled.IsValid() || G.behaviourGetEnabled[el[i]]())) r = el[i];
+        for (uintptr_t i = 0; i < n && !Alive(r); i++) if (Alive(el[i])) r = el[i];
+        ym::log("clientdabell: %d voice recorders in the scene", (int)n);
+    }
+    if (!Alive(r)) return nullptr;
+    g_recorder.set(r);
+    return r;
+}
+
+static void RecSetInput(Il2CppObject *r, int type, Il2CppObject *clip, bool loop) {
+    // The clip first, so the Recorder never restarts on "AudioClip" with no clip
+    if (type == 1) {
+        if (G.recSetClip.IsValid()) G.recSetClip[r](clip);
+        else if (G.recFieldClip.IsValid()) G.recFieldClip[r] = clip;
+    }
+    if (G.recSetLoop.IsValid()) G.recSetLoop[r](loop);
+    if (G.recFieldLoop.IsValid()) G.recFieldLoop[r] = loop;
+    if (G.recSetSource.IsValid()) G.recSetSource[r](type);
+    if (G.recFieldSource.IsValid()) G.recFieldSource[r] = type;
+    if (type == 0) {
+        if (G.recSetClip.IsValid()) G.recSetClip[r]((Il2CppObject *)nullptr);
+        else if (G.recFieldClip.IsValid()) G.recFieldClip[r] = (Il2CppObject *)nullptr;
+    }
+}
+static void RecRestart(Il2CppObject *r) {
+    if (G.recRestart1.IsValid()) G.recRestart1[r](true);
+    else if (G.recRestart0.IsValid()) G.recRestart0[r]();
+    try { if (G.recStart.IsValid()) G.recStart[r](); } catch (...) {}   // already recording is fine
+}
+
+static void MicStop() {
+    if (!g_micOn) return;
+    g_micOn = false;
+    g_micUntil = 0;
+    Il2CppObject *r = g_recorder.get();
+    if (!Alive(r)) { g_recorder.clear(); return; }
+    try {
+        RecSetInput(r, 0, nullptr, false);
+        if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](g_micPrevTransmit);
+        if (G.recSetVad.IsValid()) G.recSetVad[r](g_micPrevVad);
+        RecRestart(r);
+        ym::log("clientdabell: voice chat back to your mic");
+    } catch (...) { ym::log("clientdabell: couldn't put the mic back"); }
+}
+
+// Sends the loaded song to the room. Returns false if it only plays for you.
+static bool MicStart() {
+    if (!f_soundMic) return false;
+    Il2CppObject *r = FindRecorder(), *clip = g_clip.get();
+    if (!r || !Alive(clip) || !(G.recSetSource.IsValid() || G.recFieldSource.IsValid())) {
+        ym::log("clientdabell: no voice recorder (type=%d), song plays only for you", G.tRecorder != nullptr);
+        return false;
+    }
+    try {
+        if (!g_micOn) {                                // save your settings once, not on every replay
+            g_micPrevTransmit = G.recGetTransmit.IsValid() ? G.recGetTransmit[r]() : true;
+            g_micPrevVad = G.recGetVad.IsValid() ? G.recGetVad[r]() : false;
+        }
+        RecSetInput(r, 1, clip, f_soundLoop);
+        if (G.recSetTransmit.IsValid()) G.recSetTransmit[r](true);     // sends even with push to talk
+        if (G.recSetVad.IsValid()) G.recSetVad[r](false);              // quiet parts aren't cut off
+        if (G.recSetOnlyWhenEnabled.IsValid()) G.recSetOnlyWhenEnabled[r](false);
+        if (G.recSetRecording.IsValid()) G.recSetRecording[r](true);
+        g_micOn = true;
+        RecRestart(r);
+    } catch (...) {
+        ym::log("clientdabell: voice chat error, putting the mic back");
+        g_micOn = true;
+        MicStop();
+        return false;
+    }
+    g_micUntil = g_time + g_clipLen + 0.5;
+    return true;
+}
+
+// Every frame: give the mic back once a song (not looping) has finished.
+static void SoundTick() {
+    if (g_micOn && !f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) MicStop();
+}
+static void SoundMicToggled() {
+    if (!f_soundMic) MicStop();
+    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+}
+
 static void PlayLoaded() {
     if (!EnsureAudioSource() || !Alive(g_clip.get())) { Notify("Couldn't start the sound"); return; }
     Il2CppObject *src = g_audioSrc.get();
@@ -1833,7 +1979,9 @@ static void PlayLoaded() {
     if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
     if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
     G.asPlay[src]();
-    Notify("Playing %.30s", SongTitle(g_clipSong).c_str());
+    bool room = MicStart();
+    Notify(room ? "Playing %.30s (room hears it)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
+           SongTitle(g_clipSong).c_str());
 }
 
 static void StartLoad(int song, bool playAfter) {
@@ -1902,6 +2050,7 @@ static void LoadTick() {
     if (n < want || L.done >= L.frames) {                            // finished (or the file ended early)
         bool play = L.playWhenDone;
         int song = L.song;
+        g_clipLen = L.rate ? (double)L.done / (double)L.rate : 0;
         AbortLoad();
         g_clipSong = song;
         if (play) PlayLoaded();
@@ -1921,10 +2070,17 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+    MicStop();
 }
 static void ApplyLoop() {
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
+    Il2CppObject *r = g_recorder.get();
+    if (g_micOn && Alive(r)) {
+        if (G.recSetLoop.IsValid()) G.recSetLoop[r](f_soundLoop);
+        if (G.recFieldLoop.IsValid()) G.recFieldLoop[r] = f_soundLoop;
+        if (!f_soundLoop) g_micUntil = g_time + g_clipLen + 0.5;     // at most one more play-through
+    }
 }
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
@@ -2599,6 +2755,8 @@ static void OnRoomChange() {
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
+    try { MicStop(); } catch (...) {}             // the voice object can outlive the room: give it your mic back
+    g_recorder.clear();
     for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
     g_audioSrc.clear();
     PauseTrackers(false);
@@ -2659,7 +2817,7 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
-    try { LoadTick(); }
+    try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
     try { WeatherTick(dt); }
     catch (...) { WeatherOff(); g_wx = -1; for (bool &b : g_wxSel) b = false; ym::log("clientdabell: effects error, turned off"); }
