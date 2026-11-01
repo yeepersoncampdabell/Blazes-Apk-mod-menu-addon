@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.2"
+#define CDB_VERSION "v1.2.2 Patch #1"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -2362,20 +2362,27 @@ static void GroundPoundTick(const Buttons &in) {
     }
 }
 
-// Bounce: every hard landing sends you back up, a little lower each time (like a rubber ball).
-static float g_bounceVy = 0;
-static double g_bounceNext = 0;
+// Bounce: every landing sends you back up, a little lower each time (like a rubber ball).
+// A landing = you were falling fast a moment ago and now you are not.
+static float g_fallPeak = 0;
+static double g_fallSeen = 0, g_bounceNext = 0;
+static int g_bounceLogged = 0;
 static void BounceTick() {
     Vector3 v;
-    if (!f_bounce || !GetVel(v)) { g_bounceVy = 0; return; }
-    if (g_bounceVy < -4.0f && v.y > g_bounceVy * 0.3f && g_time >= g_bounceNext) {   // suddenly stopped falling
-        float up = -g_bounceVy * 0.85f;
-        up = up < 7.0f ? 7.0f : up > 30.0f ? 30.0f : up;
+    if (!f_bounce || !GetVel(v)) { g_fallPeak = 0; return; }
+    if (v.y < -2.0f) {
+        if (v.y < g_fallPeak) g_fallPeak = v.y;
+        g_fallSeen = g_time;
+    } else if (g_fallPeak < -3.0f && v.y > -1.0f && g_time - g_fallSeen < 0.35 && g_time >= g_bounceNext) {
+        float up = -g_fallPeak * 0.85f;
+        up = up < 6.0f ? 6.0f : up > 30.0f ? 30.0f : up;
         SetVel(Vector3(v.x, up, v.z));
-        g_bounceNext = g_time + 0.25;
-        v.y = up;
+        g_bounceNext = g_time + 0.3;
+        if (g_bounceLogged < 6) { g_bounceLogged++; ym::log("clientdabell: bounce fall %.1f -> up %.1f", g_fallPeak, up); }
+        g_fallPeak = 0;
+    } else if (g_time - g_fallSeen > 0.35) {
+        g_fallPeak = 0;                                            // the fall ended without a landing (flying, etc.)
     }
-    g_bounceVy = v.y;
 }
 
 // Fling Gun: press A (X if the menu is on your right hand) to launch yourself the way your free hand points.
@@ -2505,14 +2512,19 @@ static void ApplyBigHands() {
     Il2CppObject *lh = g_leftHand.get(), *rh = g_rightHand.get();
     if (!lh || !rh) return;
     if (!g_trGetScale.IsValid()) g_trGetScale = Class("UnityEngine", "Transform").GetMethod("get_localScale", 0);
-    if (!g_trGetScale.IsValid()) return;
-    if (f_bigHands && !g_bigApplied) {
-        g_handScaleL = g_trGetScale[lh]();
-        g_handScaleR = g_trGetScale[rh]();
-        G.trSetLocalScale[lh](g_handScaleL * 2.5f);
-        G.trSetLocalScale[rh](g_handScaleR * 2.5f);
-        g_bigApplied = true;
-    } else if (!f_bigHands && g_bigApplied) {
+    if (!g_trGetScale.IsValid()) { static bool once = false; if (!once) { once = true; ym::log("clientdabell: big hands: can't read hand scale"); } return; }
+    static Method<int> childCount = Class("UnityEngine", "Transform").GetMethod("get_childCount", 0);
+    if (f_bigHands) {
+        if (!g_bigApplied) {                                       // remember the normal size once
+            g_handScaleL = g_trGetScale[lh]();
+            g_handScaleR = g_trGetScale[rh]();
+            g_bigApplied = true;
+            ym::log("clientdabell: big hands on: normal scale %.2f/%.2f, children %d/%d", g_handScaleL.x, g_handScaleR.x,
+                    childCount.IsValid() ? childCount[lh]() : -1, childCount.IsValid() ? childCount[rh]() : -1);
+        }
+        G.trSetLocalScale[lh](g_handScaleL * 3.0f);                // every frame: the game may set it back
+        G.trSetLocalScale[rh](g_handScaleR * 3.0f);
+    } else if (g_bigApplied) {
         G.trSetLocalScale[lh](g_handScaleL);
         G.trSetLocalScale[rh](g_handScaleR);
         g_bigApplied = false;
@@ -2532,7 +2544,7 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     FlingGunTick(in);
     BounceTick();
     ItemGunTick(in, dt);
-    if (f_bigHands != g_bigApplied) ApplyBigHands();           // also puts them back after Turn Everything Off
+    if (f_bigHands || g_bigApplied) ApplyBigHands();           // every frame while on, and once to put them back
     LongArmsTick();
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
